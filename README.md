@@ -30,8 +30,8 @@ query which product it would recommend, then reports which rewrite won and which
 - [Beyond one category](#beyond-one-category)
 - [Adoption path for a brand](#adoption-path-for-a-brand)
 - [Development](#development)
-- [License](#license)
 - [Limitations](#limitations)
+- [License](#license)
 
 ## The gap we are solving
 
