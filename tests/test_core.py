@@ -1,8 +1,16 @@
-import json
 
-from intenttwin.core import (assert_competitors_unchanged, check_constraint, fuse,
-                             paired_metrics, render_treatment, stable_hash,
-                             treatment_claim_errors, validate_recommendation)
+import pytest
+
+from intenttwin.core import (
+    assert_competitors_unchanged,
+    check_constraint,
+    compute_paired_metrics,
+    fuse_ranks,
+    render_treatment,
+    stable_hash,
+    treatment_claim_errors,
+    validate_recommendation,
+)
 
 
 def product(pid="pb-017", capacity=20000):
@@ -38,9 +46,8 @@ def test_normalized_does_not_infer_one_port_from_ten_thousand_capacity():
 
 def test_competitor_mutation_fails_run():
     rows = [{"product_id": "other", "content_hash": "a"}, {"product_id": "other", "content_hash": "b"}]
-    try: assert_competitors_unchanged(rows, "put")
-    except ValueError: pass
-    else: raise AssertionError("mutation accepted")
+    with pytest.raises(ValueError):
+        assert_competitors_unchanged(rows, "put")
 
 
 def test_misleading_control_detected():
@@ -57,7 +64,7 @@ def test_constraint_pass_fail_unknown():
 
 
 def test_rrf_matches_hand_calculation():
-    result = dict(fuse({"a": [("p1", 5), ("p2", 1)], "b": [("p2", 7), ("p1", 2)]}))
+    result = dict(fuse_ranks({"a": [("p1", 5), ("p2", 1)], "b": [("p2", 7), ("p1", 2)]}))
     assert result["p1"] == result["p2"] == 1 / 61 + 1 / 62
 
 
@@ -73,8 +80,8 @@ def test_bootstrap_is_seed_reproducible_and_trials_grouped():
     rows = []
     for trial in range(3):
         rows += [{"query_group_id": "q1", "condition": "original", "ordered_product_ids": []}, {"query_group_id": "q1", "condition": "normalized", "ordered_product_ids": ["put"]}]
-    first = paired_metrics(rows, "put", samples=50)
-    assert first == paired_metrics(rows, "put", samples=50)
+    first = compute_paired_metrics(rows, "put", samples=50)
+    assert first == compute_paired_metrics(rows, "put", samples=50)
     normalized = next(row for row in first if row["condition"] == "normalized")
     assert normalized["groups"] == 1
     assert normalized["ci_low"] is None

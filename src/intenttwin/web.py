@@ -1,8 +1,9 @@
-from __future__ import annotations
+"""FastAPI dashboard: run creation, live status polling, and result rendering."""
 
 import json
 import os
-from pathlib import Path
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
 
 import uvicorn
@@ -11,27 +12,52 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .db import ROOT, all, connect, decode, migrate, one
-from .pipeline import (STAGES, cancel_run, create_confirmation_run, create_geo_run,
-                       create_run, load_fixture, load_gap_report,
-                       retry_gap_summary, start_worker)
-from .reasoning import llm_configured, load_env_file
+from .db import ROOT, connect, decode_json_fields, fetch_all, fetch_one
 from .geo import submission_form
+from .pipeline import (
+    cancel_run,
+    create_confirmation_run,
+    create_geo_run,
+    create_run,
+    load_fixture,
+    load_gap_report,
+    retry_gap_summary,
+    start_worker,
+)
+from .reasoning import llm_configured, load_env_file
 
-app = FastAPI(title="The GEO Lab", docs_url="/api/docs")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Requeue runs interrupted by a restart, then hand control to the server."""
+    load_fixture()
+    with connect() as db:
+        db.execute("UPDATE runs SET status='cancelled',completed_at=CURRENT_TIMESTAMP WHERE status='running' AND cancel_requested=1")
+        db.execute("UPDATE run_jobs SET status='cancelled',completed_at=CURRENT_TIMESTAMP WHERE status='running' AND run_id IN (SELECT id FROM runs WHERE status='cancelled')")
+        db.execute("UPDATE runs SET status='queued' WHERE status='running' AND cancel_requested=0")
+        db.execute("UPDATE run_jobs SET status='pending',started_at=NULL WHERE status='running' AND run_id IN (SELECT id FROM runs WHERE status='queued')")
+    start_worker()
+    yield
+
+
+CONTROL_CONDITIONS = {"identity_copy", "identity_control", "misleading_control"}
+NEUTRAL_TOLERANCE = 0.00005
+STALL_WARNING_SECONDS = 35
+
+app = FastAPI(title="The GEO Lab", docs_url="/api/docs", lifespan=lifespan)
 templates = Jinja2Templates(directory=ROOT / "src" / "intenttwin" / "templates")
 app.mount("/static", StaticFiles(directory=ROOT / "src" / "intenttwin" / "static"), name="static")
 
 
-def _pp(value: float) -> str:
+def _format_points(value: float) -> str:
     return f"{value * 100:+.1f} percentage points"
 
 
-def _effect_class(condition: str, value: float) -> str:
+def _classify_effect(condition: str, value: float) -> str:
     if condition == "original":
         return "metric-neutral"
-    if condition in {"identity_copy", "identity_control", "misleading_control"}:
-        return "metric-good" if abs(value) < 0.00005 else "metric-bad"
+    if condition in CONTROL_CONDITIONS:
+        return "metric-good" if abs(value) < NEUTRAL_TOLERANCE else "metric-bad"
     if value > 0:
         return "metric-good"
     if value < 0:
@@ -44,16 +70,16 @@ def decorate_metrics(metrics: list[dict]) -> list[dict]:
     for source in metrics:
         metric = dict(source)
         condition = metric["condition"]
-        metric["inclusion_class"] = _effect_class(condition, metric.get("inclusion_delta", 0))
-        metric["recommendation_class"] = _effect_class(condition, metric.get("delta", 0))
-        metric["retrieval_mrr_class"] = _effect_class(condition, metric.get("retrieval_mrr_delta", 0))
-        metric["retrieval_top3_class"] = _effect_class(condition, metric.get("retrieval_top3_delta", 0))
-        metric["top1_class"] = _effect_class(condition, metric.get("top1_delta", 0))
-        metric["top3_class"] = _effect_class(condition, metric.get("top3_delta", 0))
+        metric["inclusion_class"] = _classify_effect(condition, metric.get("inclusion_delta", 0))
+        metric["recommendation_class"] = _classify_effect(condition, metric.get("delta", 0))
+        metric["retrieval_mrr_class"] = _classify_effect(condition, metric.get("retrieval_mrr_delta", 0))
+        metric["retrieval_top3_class"] = _classify_effect(condition, metric.get("retrieval_top3_delta", 0))
+        metric["top1_class"] = _classify_effect(condition, metric.get("top1_delta", 0))
+        metric["top3_class"] = _classify_effect(condition, metric.get("top3_delta", 0))
         low, high = metric.get("ci_low"), metric.get("ci_high")
         if condition == "original" or low is None or high is None:
             metric["interval_class"] = "metric-neutral"
-        elif condition in {"identity_copy", "identity_control", "misleading_control"}:
+        elif condition in CONTROL_CONDITIONS:
             metric["interval_class"] = metric["recommendation_class"]
         elif low > 0:
             metric["interval_class"] = "metric-good"
@@ -82,31 +108,31 @@ def build_metric_conclusion(metrics: list[dict]) -> dict | None:
     retrieval_delta = grounded.get("inclusion_delta", 0)
     recommendation_delta = grounded.get("delta", 0)
     if retrieval_delta > 0:
-        retrieval_direction = f"Grounded enrichment retrieved the PUT more often ({_pp(retrieval_delta)} versus original)."
+        retrieval_direction = f"Grounded enrichment retrieved the PUT more often ({_format_points(retrieval_delta)} versus original)."
     elif retrieval_delta < 0:
-        retrieval_direction = f"Grounded enrichment retrieved the PUT less often ({_pp(retrieval_delta)} versus original)."
+        retrieval_direction = f"Grounded enrichment retrieved the PUT less often ({_format_points(retrieval_delta)} versus original)."
     else:
         retrieval_direction = "Grounded enrichment did not change reasoning-set retrieval versus original."
 
     low, high = grounded.get("ci_low"), grounded.get("ci_high")
     if low is not None and low > 0:
-        recommendation_strength = f"The recommendation lift ({_pp(recommendation_delta)}) is consistently positive in this run."
+        recommendation_strength = f"The recommendation lift ({_format_points(recommendation_delta)}) is consistently positive in this run."
         headline_class = "conclusion-good" if retrieval_delta >= 0 else "conclusion-warning"
     elif high is not None and high < 0:
-        recommendation_strength = f"Recommendation decreased ({_pp(recommendation_delta)}) and the interval stays below zero."
+        recommendation_strength = f"Recommendation decreased ({_format_points(recommendation_delta)}) and the interval stays below zero."
         headline_class = "conclusion-bad"
     else:
-        recommendation_strength = f"The recommendation change ({_pp(recommendation_delta)}) is uncertain because its interval includes zero."
+        recommendation_strength = f"The recommendation change ({_format_points(recommendation_delta)}) is uncertain because its interval includes zero."
         headline_class = "conclusion-warning"
 
     normalized_text = ""
     if normalized:
-        normalized_text = f" Normalization changed retrieval by {_pp(normalized.get('inclusion_delta', 0))}."
+        normalized_text = f" Normalization changed retrieval by {_format_points(normalized.get('inclusion_delta', 0))}."
     identity_retrieval = identity.get("inclusion_delta", 0) if identity else 0
     identity_recommendation = identity.get("delta", 0) if identity else 0
-    identity_text = "Identity control passed for retrieval." if abs(identity_retrieval) < 0.00005 else f"Identity control failed for retrieval ({_pp(identity_retrieval)}); do not trust treatment retrieval effects."
-    if abs(identity_recommendation) >= 0.00005:
-        identity_text += f" Its recommendation drift of {_pp(identity_recommendation)} shows model variability."
+    identity_text = "Identity control passed for retrieval." if abs(identity_retrieval) < NEUTRAL_TOLERANCE else f"Identity control failed for retrieval ({_format_points(identity_retrieval)}); do not trust treatment retrieval effects."
+    if abs(identity_recommendation) >= NEUTRAL_TOLERANCE:
+        identity_text += f" Its recommendation drift of {_format_points(identity_recommendation)} shows model variability."
     misleading_detected = misleading and misleading.get("attempts", 0) and misleading.get("unsupported_template_claims", 0) == misleading.get("attempts", 0)
     safety_text = "Misleading-control claims were detected in every attempt." if misleading_detected else "The misleading safety control was not fully detected; do not make safety claims."
 
@@ -122,17 +148,6 @@ def build_metric_conclusion(metrics: list[dict]) -> dict | None:
     }
 
 
-@app.on_event("startup")
-def startup() -> None:
-    load_fixture()
-    with connect() as db:
-        db.execute("UPDATE runs SET status='cancelled',completed_at=CURRENT_TIMESTAMP WHERE status='running' AND cancel_requested=1")
-        db.execute("UPDATE run_jobs SET status='cancelled',completed_at=CURRENT_TIMESTAMP WHERE status='running' AND run_id IN (SELECT id FROM runs WHERE status='cancelled')")
-        db.execute("UPDATE runs SET status='queued' WHERE status='running' AND cancel_requested=0")
-        db.execute("UPDATE run_jobs SET status='pending',started_at=NULL WHERE status='running' AND run_id IN (SELECT id FROM runs WHERE status='queued')")
-    start_worker()
-
-
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
     return RedirectResponse("/runs")
@@ -140,7 +155,7 @@ def root() -> RedirectResponse:
 
 @app.get("/runs", response_class=HTMLResponse)
 def runs(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request, "runs.html", {"runs": all("SELECT *,json_extract(manifest_json,'$.recommendation_model') AS model,json_extract(manifest_json,'$.product_snapshot.name') AS product_name,json_extract(manifest_json,'$.phase') AS phase FROM runs ORDER BY id DESC"), "llm_ready": llm_configured()})
+    return templates.TemplateResponse(request, "runs.html", {"runs": fetch_all("SELECT *,json_extract(manifest_json,'$.recommendation_model') AS model,json_extract(manifest_json,'$.product_snapshot.name') AS product_name,json_extract(manifest_json,'$.phase') AS phase FROM runs ORDER BY id DESC"), "llm_ready": llm_configured()})
 
 
 @app.post("/runs")
@@ -161,16 +176,17 @@ async def new_run(request: Request) -> RedirectResponse:
 
 @app.get("/runs/{run_id}", response_class=HTMLResponse)
 def run_detail(request: Request, run_id: int) -> HTMLResponse:
-    run = one("SELECT * FROM runs WHERE id=?", (run_id,))
-    if not run: raise HTTPException(404)
-    run = decode(run, "manifest_json")
-    jobs = all("SELECT * FROM run_jobs WHERE run_id=? ORDER BY position", (run_id,))
-    metrics = [decode(row, "data_json")["data_json"] for row in all("SELECT * FROM metrics WHERE run_id=? ORDER BY condition", (run_id,))]
+    run = fetch_one("SELECT * FROM runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404)
+    run = decode_json_fields(run, "manifest_json")
+    jobs = fetch_all("SELECT * FROM run_jobs WHERE run_id=? ORDER BY position", (run_id,))
+    metrics = [decode_json_fields(row, "data_json")["data_json"] for row in fetch_all("SELECT * FROM metrics WHERE run_id=? ORDER BY condition", (run_id,))]
     gap_report = load_gap_report(run_id)
     conclusion = None if gap_report else build_metric_conclusion(metrics)
     metrics = decorate_metrics(metrics)
-    failures = all("SELECT a.query_group_id,a.condition,a.trial,v.errors_json FROM validations v JOIN llm_attempts a ON a.id=v.attempt_id WHERE a.run_id=? AND v.valid=0", (run_id,))
-    artifacts = all("SELECT * FROM artifacts WHERE run_id=?", (run_id,))
+    failures = fetch_all("SELECT a.query_group_id,a.condition,a.trial,v.errors_json FROM validations v JOIN llm_attempts a ON a.id=v.attempt_id WHERE a.run_id=? AND v.valid=0", (run_id,))
+    artifacts = fetch_all("SELECT * FROM artifacts WHERE run_id=?", (run_id,))
     return templates.TemplateResponse(request, "run_detail.html", {"run": run, "jobs": jobs, "metrics": metrics, "conclusion": conclusion, "gap_report": gap_report, "failures": failures, "artifacts": artifacts})
 
 
@@ -205,8 +221,9 @@ def cancel(request: Request, run_id: int):
 
 @app.post("/runs/{run_id}/retry")
 def retry(run_id: int) -> RedirectResponse:
-    run = one("SELECT * FROM runs WHERE id=?", (run_id,))
-    if not run: raise HTTPException(404)
+    run = fetch_one("SELECT * FROM runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404)
     manifest = json.loads(run["manifest_json"])
     if manifest.get("experiment_version") == "geo-gap-v1":
         form = submission_form(manifest["product_snapshot"])
@@ -219,29 +236,32 @@ def retry(run_id: int) -> RedirectResponse:
 
 @app.post("/runs/{run_id}/lock")
 def lock(run_id: int) -> RedirectResponse:
-    with connect() as db: db.execute("UPDATE runs SET locked=1 WHERE id=?", (run_id,))
+    with connect() as db:
+        db.execute("UPDATE runs SET locked=1 WHERE id=?", (run_id,))
     return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
 @app.get("/runs/{run_id}/artifact/{artifact_id}")
 def artifact(run_id: int, artifact_id: int) -> FileResponse:
-    row = one("SELECT * FROM artifacts WHERE id=? AND run_id=?", (artifact_id, run_id))
-    if not row: raise HTTPException(404)
+    row = fetch_one("SELECT * FROM artifacts WHERE id=? AND run_id=?", (artifact_id, run_id))
+    if not row:
+        raise HTTPException(404)
     return FileResponse(row["path"], filename=row["name"])
 
 
 @app.get("/api/runs/{run_id}/status")
 def status(run_id: int) -> dict:
-    run = one("SELECT * FROM runs WHERE id=?", (run_id,))
-    if not run: raise HTTPException(404)
-    jobs = all("SELECT stage,status,log_text,error_text,started_at,completed_at,CASE WHEN status='running' THEN CAST(strftime('%s','now')-strftime('%s',started_at) AS INTEGER) END AS seconds_idle FROM run_jobs WHERE run_id=? ORDER BY position", (run_id,))
+    run = fetch_one("SELECT * FROM runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404)
+    jobs = fetch_all("SELECT stage,status,log_text,error_text,started_at,completed_at,CASE WHEN status='running' THEN CAST(strftime('%s','now')-strftime('%s',started_at) AS INTEGER) END AS seconds_idle FROM run_jobs WHERE run_id=? ORDER BY position", (run_id,))
     current = next((job for job in jobs if job["status"] == "running"), None)
     if run["status"] == "cancelling":
         detail = "Cancellation requested; waiting for current LLM call to stop."
     elif run["status"] == "queued":
-        ahead = one("SELECT COUNT(*) AS count FROM runs WHERE status IN ('queued','running','cancelling') AND id<?", (run_id,))["count"]
+        ahead = fetch_one("SELECT COUNT(*) AS count FROM runs WHERE status IN ('queued','running','cancelling') AND id<?", (run_id,))["count"]
         detail = f"Pending; {ahead} run(s) ahead."
-    elif current and (current["seconds_idle"] or 0) > 35:
+    elif current and (current["seconds_idle"] or 0) > STALL_WARNING_SECONDS:
         detail = f"No activity for {current['seconds_idle']}s; current call may be slow or stuck."
     elif current:
         detail = current["log_text"].splitlines()[-1] if current["log_text"] else f"Running {current['stage']}."
@@ -255,17 +275,17 @@ def status(run_id: int) -> dict:
 
 @app.get("/api/runs/{run_id}/metrics")
 def metrics(run_id: int) -> list[dict]:
-    return [json.loads(row["data_json"]) for row in all("SELECT data_json FROM metrics WHERE run_id=?", (run_id,))]
+    return [json.loads(row["data_json"]) for row in fetch_all("SELECT data_json FROM metrics WHERE run_id=?", (run_id,))]
 
 
 @app.get("/api/runs/{run_id}/retrieval/{query_group_id}")
 def retrieval(run_id: int, query_group_id: str) -> list[dict]:
-    return all("SELECT condition,channel,product_id,score,rank FROM retrieval_traces WHERE run_id=? AND query_group_id=? ORDER BY condition,channel,rank", (run_id, query_group_id))
+    return fetch_all("SELECT condition,channel,product_id,score,rank FROM retrieval_traces WHERE run_id=? AND query_group_id=? ORDER BY condition,channel,rank", (run_id, query_group_id))
 
 
 @app.get("/api/runs/{run_id}/failures")
 def failures(run_id: int) -> list[dict]:
-    return all("SELECT a.query_group_id,a.condition,a.trial,v.errors_json FROM validations v JOIN llm_attempts a ON a.id=v.attempt_id WHERE a.run_id=? AND v.valid=0", (run_id,))
+    return fetch_all("SELECT a.query_group_id,a.condition,a.trial,v.errors_json FROM validations v JOIN llm_attempts a ON a.id=v.attempt_id WHERE a.run_id=? AND v.valid=0", (run_id,))
 
 
 def main() -> None:
@@ -273,4 +293,5 @@ def main() -> None:
     uvicorn.run("intenttwin.web:app", host=os.getenv("INTENTTWIN_HOST", "127.0.0.1"), port=int(os.getenv("INTENTTWIN_PORT", "8000")), reload=False)
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()

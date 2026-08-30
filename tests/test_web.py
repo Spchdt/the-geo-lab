@@ -1,5 +1,5 @@
-from intenttwin.web import build_metric_conclusion, decorate_metrics
 from intenttwin.db import ROOT
+from intenttwin.web import build_metric_conclusion, decorate_metrics
 
 
 def test_metric_conclusion_explains_stage_difference_and_controls():

@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Deterministic retrieval, treatment rendering, and paired-metric primitives."""
 
 import hashlib
 import json
@@ -6,12 +6,15 @@ import math
 import random
 import re
 from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 
+SEMANTIC_DIMENSIONS = 128
+RRF_K = 60
+BOOTSTRAP_SAMPLES = 1000
+ANALYSIS_SEED = 20260829
 CONDITIONS = ("original", "normalized", "grounded_enriched", "identity_copy", "misleading_control")
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -31,7 +34,7 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def facts_by_predicate(product: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def index_facts_by_predicate(product: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {fact["predicate"]: fact for fact in product["facts"]}
 
 
@@ -65,7 +68,7 @@ def render_treatment(product: dict[str, Any], original: str, condition: str, is_
         body = original.replace("\r\n", "\n") if condition != "identity_copy" else original
         exposed = [fact["fact_id"] for fact in product["facts"] if fact_is_exposed(fact, body)]
     else:
-        facts = facts_by_predicate(product)
+        facts = index_facts_by_predicate(product)
         exposed = [f["fact_id"] for f in product["facts"] if f["status"] == "verified"]
         if condition == "normalized":
             exposed_facts = [f for f in product["facts"] if fact_is_exposed(f, original)]
@@ -117,7 +120,7 @@ def treatment_claim_errors(product: dict[str, Any], presentation: dict[str, Any]
 
 
 def check_constraint(product: dict[str, Any], constraints: list[dict[str, Any]]) -> tuple[str, list[str]]:
-    facts = facts_by_predicate(product)
+    facts = index_facts_by_predicate(product)
     unknown, reasons = False, []
     ops = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, "=": lambda a, b: a == b}
     for rule in constraints:
@@ -130,27 +133,27 @@ def check_constraint(product: dict[str, Any], constraints: list[dict[str, Any]])
     return ("UNKNOWN" if unknown else "PASS"), reasons
 
 
-def tokens(text: str) -> list[str]:
+def tokenize(text: str) -> list[str]:
     return TOKEN_RE.findall(text.lower())
 
 
-def semantic_vector(text: str, dims: int = 128) -> np.ndarray:
+def embed_text(text: str, dims: int = SEMANTIC_DIMENSIONS) -> np.ndarray:
     vector = np.zeros(dims)
-    for token in tokens(text):
+    for token in tokenize(text):
         digest = hashlib.sha256(token.encode()).digest()
         vector[int.from_bytes(digest[:2], "big") % dims] += 1 if digest[2] % 2 else -1
     norm = np.linalg.norm(vector)
     return vector / norm if norm else vector
 
 
-def channel_ranks(query: dict[str, Any], presentations: list[dict[str, Any]], products: dict[str, dict[str, Any]]) -> dict[str, list[tuple[str, float]]]:
-    query_tokens = set(tokens(query["text"]))
-    query_vec = semantic_vector(query["text"])
+def rank_channels(query: dict[str, Any], presentations: list[dict[str, Any]]) -> dict[str, list[tuple[str, float]]]:
+    query_tokens = set(tokenize(query["text"]))
+    query_vec = embed_text(query["text"])
     channels: dict[str, list[tuple[str, float]]] = {"lexical": [], "semantic": [], "attribute": []}
     for item in presentations:
-        body_tokens = tokens(item["body"])
+        body_tokens = tokenize(item["body"])
         lexical = sum(1 for token in body_tokens if token in query_tokens) / math.sqrt(max(1, len(body_tokens)))
-        semantic = float(np.dot(query_vec, semantic_vector(item["body"])))
+        semantic = float(np.dot(query_vec, embed_text(item["body"])))
         exposed = {fact_id.rsplit(":", 1)[-1] for fact_id in item["exposed_fact_ids"]}
         attribute = sum(1.0 for rule in query["hard_constraints"] if rule["predicate"] in exposed)
         for channel, score in (("lexical", lexical), ("semantic", semantic), ("attribute", attribute)):
@@ -160,7 +163,7 @@ def channel_ranks(query: dict[str, Any], presentations: list[dict[str, Any]], pr
     return channels
 
 
-def fuse(channels: dict[str, list[tuple[str, float]]], k: int = 60) -> list[tuple[str, float]]:
+def fuse_ranks(channels: dict[str, list[tuple[str, float]]], k: int = RRF_K) -> list[tuple[str, float]]:
     scores: dict[str, float] = defaultdict(float)
     for rows in channels.values():
         for rank, (product_id, _score) in enumerate(rows, 1):
@@ -192,7 +195,7 @@ def validate_recommendation(output: dict[str, Any], candidates: set[str], expose
     return errors
 
 
-def paired_metrics(rows: Iterable[dict[str, Any]], put_id: str, seed: int = 20260829, samples: int = 1000, conditions: Iterable[str] | None = None) -> list[dict[str, Any]]:
+def compute_paired_metrics(rows: Iterable[dict[str, Any]], put_id: str, seed: int = ANALYSIS_SEED, samples: int = BOOTSTRAP_SAMPLES, conditions: Iterable[str] | None = None) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, list[dict[str, float]]]] = defaultdict(lambda: defaultdict(list))
     seen_conditions: list[str] = []
     for row in rows:
