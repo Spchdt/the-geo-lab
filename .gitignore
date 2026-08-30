@@ -8,3 +8,4 @@ data/artifacts/*
 __pycache__/
 .pytest_cache/
 .DS_Store
+.ruff_cache/

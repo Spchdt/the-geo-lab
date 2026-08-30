@@ -3,106 +3,94 @@ import os
 import time
 
 import pytest
+from conftest import form
 
-from intenttwin.db import connect, fetch_all, fetch_one, migrate
-from intenttwin.pipeline import cancel_run, create_run, resolve_suite_path, wait_with_cancel
-from intenttwin.reasoning import LLMRequestError, load_env_file
+from geolab.db import connect, fetch_all, fetch_one, migrate
+from geolab.pipeline import cancel_run, create_geo_run, wait_with_cancel
+from geolab.reasoning import LLMRequestError, load_env_file
 
 
 def test_provider_wait_never_sleeps_for_negative_time(monkeypatch):
     clock = iter([0.0, 0.5, 1.1])
     sleeps = []
-    monkeypatch.setattr("intenttwin.pipeline.time.monotonic", lambda: next(clock))
-    monkeypatch.setattr("intenttwin.pipeline.time.sleep", sleeps.append)
-    monkeypatch.setattr("intenttwin.pipeline.cancel_requested", lambda run_id: False)
+    monkeypatch.setattr("geolab.pipeline.time.monotonic", lambda: next(clock))
+    monkeypatch.setattr("geolab.pipeline.time.sleep", sleeps.append)
+    monkeypatch.setattr("geolab.pipeline.cancel_requested", lambda run_id: False)
     assert wait_with_cancel(1, 1.0)
     assert sleeps == [0.25]
 
 
-def test_all_condition_smoke_pairs_60_calls_and_reuses_cache(tmp_path, monkeypatch):
-    monkeypatch.setattr("intenttwin.db.DB_PATH", tmp_path / "test.db")
-    monkeypatch.setattr("intenttwin.pipeline.connect", connect)
-    monkeypatch.setenv("INTENTTWIN_LLM_URL", "https://recorded.test/v1/chat/completions")
-    monkeypatch.setenv("INTENTTWIN_LLM_MODEL", "recorded-test-model")
-    monkeypatch.setenv("INTENTTWIN_LLM_API_KEY", "test-key")
-    monkeypatch.setenv("INTENTTWIN_LLM_MIN_INTERVAL", "0")
-    monkeypatch.setenv("INTENTTWIN_LLM_RATE_LIMIT_BASE_DELAY", "0")
+def await_run(run_id, attempts=300):
+    for _ in range(attempts):
+        run = fetch_one("SELECT * FROM runs WHERE id=?", (run_id,))
+        if run and run["status"] not in {"queued", "running"}:
+            return run
+        time.sleep(0.03)
+    raise AssertionError(f"run {run_id} never settled")
+
+
+def test_screen_survives_rate_limits_and_reuses_cached_observations(tmp_path, monkeypatch):
+    monkeypatch.setattr("geolab.db.DB_PATH", tmp_path / "cache.db")
+    monkeypatch.setattr("geolab.pipeline.connect", connect)
+    monkeypatch.setenv("GEOLAB_LLM_URL", "https://recorded.test/v1/chat/completions")
+    monkeypatch.setenv("GEOLAB_LLM_MODEL", "recorded-test-model")
+    monkeypatch.setenv("GEOLAB_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("GEOLAB_LLM_MIN_INTERVAL", "0")
+    monkeypatch.setenv("GEOLAB_LLM_RATE_LIMIT_BASE_DELAY", "0")
     live_calls = []
     rate_limited = True
+
     def recorded(request):
         nonlocal rate_limited
         live_calls.append(request)
         if rate_limited:
             rate_limited = False
             raise LLMRequestError("LLM HTTP 429: quota exceeded", status_code=429, retry_after=0)
-        with connect() as db:
-            db.execute("UPDATE runs SET progress=progress WHERE id=(SELECT MAX(id) FROM runs)")
         picked = request["candidates"][:2]
         presented = {row["product_id"]: row for row in request["candidate_presentations"]}
         claims = [{"product_id": product_id, "text": "Recorded response.", "evidence_ids": presented[product_id]["exposed_evidence_ids"][:1]} for product_id in picked if presented[product_id]["exposed_evidence_ids"]]
         return {"decision": "recommend", "ordered_product_ids": picked, "claims": claims, "uncertainty": "low"}, "recorded-test-model", 0
-    monkeypatch.setattr("intenttwin.pipeline.recommend", recorded)
-    run_id = create_run()
-    for _ in range(200):
-        run = fetch_one("SELECT * FROM runs WHERE id=?", (run_id,))
-        if run and run["status"] not in {"queued", "running"}:
-            break
-        time.sleep(.03)
-    assert run["status"] == "passed"
-    assert len(fetch_all("SELECT * FROM metrics WHERE run_id=?", (run_id,))) == 5
-    attempts = fetch_all("SELECT query_group_id,condition,trial,request_json FROM llm_attempts WHERE run_id=? ORDER BY id", (run_id,))
+
+    def summarized(request):
+        return {"headline": "Controlled result.", "gaps": [], "suggestions": [], "revised_title": "PocketVolt", "revised_body": "Verified listing details.", "caveat": "Controlled catalogue only."}, "recorded-test-model", 0
+
+    monkeypatch.setattr("geolab.pipeline.recommend", recorded)
+    monkeypatch.setattr("geolab.pipeline.summarize_gap_report", summarized)
+
+    run_id = create_geo_run(form())
+    assert await_run(run_id)["status"] == "passed"
+    attempts = fetch_all("SELECT query_group_id,condition,request_json FROM llm_attempts WHERE run_id=? ORDER BY id", (run_id,))
     assert len(attempts) == 60
+    assert len(live_calls) == 61
+
     first_group = [row for row in attempts if row["query_group_id"] == attempts[0]["query_group_id"]]
     requests = [json.loads(row["request_json"]) for row in first_group]
-    assert {row["condition"] for row in first_group} == {"original", "normalized", "grounded_enriched", "identity_copy", "misleading_control"}
     assert all(requests[0]["candidates"] == request["candidates"] for request in requests[1:])
-    first = {row["product_id"]: row["presentation"] for row in requests[0]["candidate_presentations"]}
+    baseline = {row["product_id"]: row["presentation"] for row in requests[0]["candidate_presentations"]}
     treatment = {row["product_id"]: row["presentation"] for row in requests[2]["candidate_presentations"]}
-    assert first["pb-017"] != treatment["pb-017"]
-    assert all(first[product_id] == treatment[product_id] for product_id in first if product_id != "pb-017")
-    assert len(live_calls) == 61
-    assert "Rate limited (1/8)" in fetch_one("SELECT log_text FROM run_jobs WHERE run_id=? AND stage='reason'", (run_id,))["log_text"]
+    put_id = fetch_one("SELECT put_product_id FROM runs WHERE id=?", (run_id,))["put_product_id"]
+    assert baseline[put_id] != treatment[put_id]
+    assert all(baseline[product_id] == treatment[product_id] for product_id in baseline if product_id != put_id)
+
+    log = fetch_one("SELECT log_text FROM run_jobs WHERE run_id=? AND stage='reason'", (run_id,))["log_text"]
+    assert "Rate limited (1/8)" in log
+
     misleading = json.loads(fetch_one("SELECT data_json FROM metrics WHERE run_id=? AND condition='misleading_control'", (run_id,))["data_json"])
-    assert misleading["unsupported_template_claims"] == 12
     assert misleading["unsupported_template_claim_rate"] == 1
     assert misleading["valid_attempts"] == 0
 
-    cached_run_id = create_run()
-    for _ in range(200):
-        cached_run = fetch_one("SELECT * FROM runs WHERE id=?", (cached_run_id,))
-        if cached_run and cached_run["status"] not in {"queued", "running"}:
-            break
-        time.sleep(.03)
-    assert cached_run["status"] == "passed"
+    cached_run_id = create_geo_run(form())
+    assert await_run(cached_run_id)["status"] == "passed"
     assert len(live_calls) == 61
     assert {row["status"] for row in fetch_all("SELECT status FROM llm_attempts WHERE run_id=?", (cached_run_id,))} == {"cached"}
 
 
-def test_paper_suite_contract_and_sealed_gate(tmp_path, monkeypatch):
-    assert sum(1 for line in resolve_suite_path("diagnostic").read_text().splitlines() if line) == 24
-    assert sum(1 for line in resolve_suite_path("demand").read_text().splitlines() if line) == 40
-    assert sum(1 for line in resolve_suite_path("sealed").read_text().splitlines() if line) == 40
-    monkeypatch.setattr("intenttwin.db.DB_PATH", tmp_path / "sealed.db")
-    monkeypatch.setattr("intenttwin.pipeline.connect", connect)
-    monkeypatch.setenv("INTENTTWIN_LLM_URL", "https://recorded.test/v1/chat/completions")
-    monkeypatch.setenv("INTENTTWIN_LLM_MODEL", "recorded-test-model")
-    monkeypatch.setenv("INTENTTWIN_LLM_API_KEY", "test-key")
-    monkeypatch.setattr("intenttwin.pipeline.start_worker", lambda: None)
-    demand_id = create_run(suite="demand")
-    manifest = json.loads(fetch_one("SELECT manifest_json FROM runs WHERE id=?", (demand_id,))["manifest_json"])
-    assert manifest["query_groups"] == 40
-    assert manifest["trials"] == 3
-    assert manifest["llm_policy"]["maximum_calls"] == 600
-    with pytest.raises(ValueError, match="locked demand revision"):
-        create_run(suite="sealed")
-
-
 def test_missing_llm_blocks_run(monkeypatch):
-    monkeypatch.setattr("intenttwin.reasoning.load_env_file", lambda path: None)
-    for name in ("INTENTTWIN_LLM_URL", "INTENTTWIN_LLM_MODEL", "INTENTTWIN_LLM_API_KEY"):
+    monkeypatch.setattr("geolab.reasoning.load_env_file", lambda path: None)
+    for name in ("GEOLAB_LLM_URL", "GEOLAB_LLM_MODEL", "GEOLAB_LLM_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(RuntimeError, match="LLM not configured"):
-        create_run()
+        create_geo_run(form())
 
 
 def test_env_file_loads_without_overwriting_shell(tmp_path, monkeypatch):
@@ -116,11 +104,11 @@ def test_env_file_loads_without_overwriting_shell(tmp_path, monkeypatch):
 
 
 def test_cancel_is_immediate_for_queued_and_acknowledged_for_running(tmp_path, monkeypatch):
-    monkeypatch.setattr("intenttwin.db.DB_PATH", tmp_path / "cancel.db")
+    monkeypatch.setattr("geolab.db.DB_PATH", tmp_path / "cancel.db")
     migrate()
     with connect() as db:
-        queued = db.execute("INSERT INTO runs(put_product_id,suite,manifest_hash,manifest_json,status) VALUES('pb','diagnostic','h','{}','queued')").lastrowid
-        running = db.execute("INSERT INTO runs(put_product_id,suite,manifest_hash,manifest_json,status) VALUES('pb','diagnostic','h','{}','running')").lastrowid
+        queued = db.execute("INSERT INTO runs(put_product_id,suite,manifest_hash,manifest_json,status) VALUES('pb','screen','h','{}','queued')").lastrowid
+        running = db.execute("INSERT INTO runs(put_product_id,suite,manifest_hash,manifest_json,status) VALUES('pb','screen','h','{}','running')").lastrowid
         db.execute("INSERT INTO run_jobs(run_id,stage,position,status) VALUES(?, 'reason', 0, 'pending')", (queued,))
         db.execute("INSERT INTO run_jobs(run_id,stage,position,status) VALUES(?, 'reason', 0, 'running')", (running,))
     assert cancel_run(queued) == "cancelled"

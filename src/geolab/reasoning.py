@@ -66,11 +66,11 @@ def load_env_file(path: Path) -> None:
 def llm_config() -> dict[str, str]:
     load_env_file(Path(__file__).resolve().parents[2] / ".env")
     config = {
-        "url": os.getenv("INTENTTWIN_LLM_URL", ""),
-        "model": os.getenv("INTENTTWIN_LLM_MODEL", ""),
-        "api_key": os.getenv("INTENTTWIN_LLM_API_KEY", ""),
+        "url": os.getenv("GEOLAB_LLM_URL", ""),
+        "model": os.getenv("GEOLAB_LLM_MODEL", ""),
+        "api_key": os.getenv("GEOLAB_LLM_API_KEY", ""),
     }
-    missing = [f"INTENTTWIN_LLM_{name.upper()}" for name, value in config.items() if not value]
+    missing = [f"GEOLAB_LLM_{name.upper()}" for name, value in config.items() if not value]
     if missing:
         raise RuntimeError("LLM not configured: " + ", ".join(missing))
     return config
@@ -108,7 +108,7 @@ def recommend(request_data: dict[str, Any]) -> tuple[dict[str, Any], str, int]:
     }
     http_request = urllib.request.Request(config["url"], data=canonical_json(body).encode(), headers={"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(http_request, timeout=float(os.getenv("INTENTTWIN_LLM_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))) as response:
+        with urllib.request.urlopen(http_request, timeout=float(os.getenv("GEOLAB_LLM_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))) as response:
             payload = json.loads(response.read())
         output = json.loads(payload["choices"][0]["message"]["content"])
     except urllib.error.HTTPError as exc:
@@ -149,7 +149,7 @@ def summarize_gap_report(request_data: dict[str, Any]) -> tuple[dict[str, Any], 
     }
     http_request = urllib.request.Request(config["url"], data=canonical_json(body).encode(), headers={"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(http_request, timeout=float(os.getenv("INTENTTWIN_LLM_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))) as response:
+        with urllib.request.urlopen(http_request, timeout=float(os.getenv("GEOLAB_LLM_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))) as response:
             payload = json.loads(response.read())
         output = json.loads(payload["choices"][0]["message"]["content"])
     except urllib.error.HTTPError as exc:

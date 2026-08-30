@@ -12,14 +12,13 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .db import ROOT, connect, decode_json_fields, fetch_all, fetch_one
+from .db import ROOT, connect, decode_json_fields, fetch_all, fetch_one, migrate
 from .geo import submission_form
 from .pipeline import (
+    IDENTITY_CONDITION,
     cancel_run,
     create_confirmation_run,
     create_geo_run,
-    create_run,
-    load_fixture,
     load_gap_report,
     retry_gap_summary,
     start_worker,
@@ -30,7 +29,7 @@ from .reasoning import llm_configured, load_env_file
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Requeue runs interrupted by a restart, then hand control to the server."""
-    load_fixture()
+    migrate()
     with connect() as db:
         db.execute("UPDATE runs SET status='cancelled',completed_at=CURRENT_TIMESTAMP WHERE status='running' AND cancel_requested=1")
         db.execute("UPDATE run_jobs SET status='cancelled',completed_at=CURRENT_TIMESTAMP WHERE status='running' AND run_id IN (SELECT id FROM runs WHERE status='cancelled')")
@@ -45,12 +44,8 @@ NEUTRAL_TOLERANCE = 0.00005
 STALL_WARNING_SECONDS = 35
 
 app = FastAPI(title="The GEO Lab", docs_url="/api/docs", lifespan=lifespan)
-templates = Jinja2Templates(directory=ROOT / "src" / "intenttwin" / "templates")
-app.mount("/static", StaticFiles(directory=ROOT / "src" / "intenttwin" / "static"), name="static")
-
-
-def _format_points(value: float) -> str:
-    return f"{value * 100:+.1f} percentage points"
+templates = Jinja2Templates(directory=ROOT / "src" / "geolab" / "templates")
+app.mount("/static", StaticFiles(directory=ROOT / "src" / "geolab" / "static"), name="static")
 
 
 def _classify_effect(condition: str, value: float) -> str:
@@ -96,58 +91,6 @@ def decorate_metrics(metrics: list[dict]) -> list[dict]:
     return decorated
 
 
-def build_metric_conclusion(metrics: list[dict]) -> dict | None:
-    by_condition = {metric["condition"]: metric for metric in metrics}
-    grounded = by_condition.get("grounded_enriched")
-    normalized = by_condition.get("normalized")
-    identity = by_condition.get("identity_copy")
-    misleading = by_condition.get("misleading_control")
-    if not grounded:
-        return None
-
-    retrieval_delta = grounded.get("inclusion_delta", 0)
-    recommendation_delta = grounded.get("delta", 0)
-    if retrieval_delta > 0:
-        retrieval_direction = f"Grounded enrichment retrieved the PUT more often ({_format_points(retrieval_delta)} versus original)."
-    elif retrieval_delta < 0:
-        retrieval_direction = f"Grounded enrichment retrieved the PUT less often ({_format_points(retrieval_delta)} versus original)."
-    else:
-        retrieval_direction = "Grounded enrichment did not change reasoning-set retrieval versus original."
-
-    low, high = grounded.get("ci_low"), grounded.get("ci_high")
-    if low is not None and low > 0:
-        recommendation_strength = f"The recommendation lift ({_format_points(recommendation_delta)}) is consistently positive in this run."
-        headline_class = "conclusion-good" if retrieval_delta >= 0 else "conclusion-warning"
-    elif high is not None and high < 0:
-        recommendation_strength = f"Recommendation decreased ({_format_points(recommendation_delta)}) and the interval stays below zero."
-        headline_class = "conclusion-bad"
-    else:
-        recommendation_strength = f"The recommendation change ({_format_points(recommendation_delta)}) is uncertain because its interval includes zero."
-        headline_class = "conclusion-warning"
-
-    normalized_text = ""
-    if normalized:
-        normalized_text = f" Normalization changed retrieval by {_format_points(normalized.get('inclusion_delta', 0))}."
-    identity_retrieval = identity.get("inclusion_delta", 0) if identity else 0
-    identity_recommendation = identity.get("delta", 0) if identity else 0
-    identity_text = "Identity control passed for retrieval." if abs(identity_retrieval) < NEUTRAL_TOLERANCE else f"Identity control failed for retrieval ({_format_points(identity_retrieval)}); do not trust treatment retrieval effects."
-    if abs(identity_recommendation) >= NEUTRAL_TOLERANCE:
-        identity_text += f" Its recommendation drift of {_format_points(identity_recommendation)} shows model variability."
-    misleading_detected = misleading and misleading.get("attempts", 0) and misleading.get("unsupported_template_claims", 0) == misleading.get("attempts", 0)
-    safety_text = "Misleading-control claims were detected in every attempt." if misleading_detected else "The misleading safety control was not fully detected; do not make safety claims."
-
-    same_direction = (retrieval_delta == 0 or recommendation_delta == 0 or (retrieval_delta > 0) == (recommendation_delta > 0))
-    relationship = "Retrieval and recommendation point in the same direction." if same_direction else "Retrieval and recommendation move in different directions. This is not automatically a contradiction: retrieval decides whether the PUT enters the reasoning set, while recommendation evaluates it inside a fixed candidate set."
-    return {
-        "class": headline_class,
-        "headline": f"{retrieval_direction} {recommendation_strength}",
-        "treatments": normalized_text.strip(),
-        "controls": f"{identity_text} {safety_text}",
-        "relationship": relationship,
-        "caveat": "Smoke-test evidence is directional, not confirmatory. ‘Recommended’ currently means the PUT appeared anywhere in the model’s ordered list, not necessarily first choice.",
-    }
-
-
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
     return RedirectResponse("/runs")
@@ -183,11 +126,10 @@ def run_detail(request: Request, run_id: int) -> HTMLResponse:
     jobs = fetch_all("SELECT * FROM run_jobs WHERE run_id=? ORDER BY position", (run_id,))
     metrics = [decode_json_fields(row, "data_json")["data_json"] for row in fetch_all("SELECT * FROM metrics WHERE run_id=? ORDER BY condition", (run_id,))]
     gap_report = load_gap_report(run_id)
-    conclusion = None if gap_report else build_metric_conclusion(metrics)
     metrics = decorate_metrics(metrics)
     failures = fetch_all("SELECT a.query_group_id,a.condition,a.trial,v.errors_json FROM validations v JOIN llm_attempts a ON a.id=v.attempt_id WHERE a.run_id=? AND v.valid=0", (run_id,))
     artifacts = fetch_all("SELECT * FROM artifacts WHERE run_id=?", (run_id,))
-    return templates.TemplateResponse(request, "run_detail.html", {"run": run, "jobs": jobs, "metrics": metrics, "conclusion": conclusion, "gap_report": gap_report, "failures": failures, "artifacts": artifacts})
+    return templates.TemplateResponse(request, "run_detail.html", {"run": run, "jobs": jobs, "metrics": metrics, "gap_report": gap_report, "failures": failures, "artifacts": artifacts})
 
 
 @app.post("/runs/{run_id}/confirm")
@@ -225,12 +167,9 @@ def retry(run_id: int) -> RedirectResponse:
     if not run:
         raise HTTPException(404)
     manifest = json.loads(run["manifest_json"])
-    if manifest.get("experiment_version") == "geo-gap-v1":
-        form = submission_form(manifest["product_snapshot"])
-        promoted = [condition for condition in manifest["conditions"] if condition not in {"original", "identity_control"}]
-        new_id = create_geo_run(form, manifest["phase"], run_id, promoted if manifest["phase"] == "confirmation" else None)
-    else:
-        new_id = create_run(run["put_product_id"], run["suite"], run_id)
+    form = submission_form(manifest["product_snapshot"])
+    promoted = [condition for condition in manifest["conditions"] if condition not in {"original", IDENTITY_CONDITION}]
+    new_id = create_geo_run(form, manifest["phase"], run_id, promoted if manifest["phase"] == "confirmation" else None)
     return RedirectResponse(f"/runs/{new_id}", status_code=303)
 
 
@@ -290,7 +229,7 @@ def failures(run_id: int) -> list[dict]:
 
 def main() -> None:
     load_env_file(ROOT / ".env")
-    uvicorn.run("intenttwin.web:app", host=os.getenv("INTENTTWIN_HOST", "127.0.0.1"), port=int(os.getenv("INTENTTWIN_PORT", "8000")), reload=False)
+    uvicorn.run("geolab.web:app", host=os.getenv("GEOLAB_HOST", "127.0.0.1"), port=int(os.getenv("GEOLAB_PORT", "8000")), reload=False)
 
 
 if __name__ == "__main__":

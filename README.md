@@ -3,7 +3,7 @@
 **Generative Engine Optimization for product listings, measured rather than guessed.**
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](./pyproject.toml)
-[![FastAPI](https://img.shields.io/badge/FastAPI-server--rendered-009688?logo=fastapi&logoColor=white)](./src/intenttwin/web.py)
+[![FastAPI](https://img.shields.io/badge/FastAPI-server--rendered-009688?logo=fastapi&logoColor=white)](./src/geolab/web.py)
 [![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)](./migrations/001_initial.sql)
 [![Tests](https://img.shields.io/badge/tests-pytest-0A9EDC?logo=pytest&logoColor=white)](./tests)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -86,16 +86,17 @@ that supports strict structured output.
 ```bash
 uv sync --extra dev
 cp .env.example .env
-uv run intenttwin
+uv run geolab
 ```
 
-Point `.env` at your provider. The example below uses Gemini's OpenAI-compatible surface:
+Point `.env` at your provider. Any endpoint that speaks the OpenAI chat-completions shape with strict
+JSON schema output works; the example below uses Google's compatibility surface:
 
 ```bash
-INTENTTWIN_LLM_URL=https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
-INTENTTWIN_LLM_MODEL=your_model_id_here
-INTENTTWIN_LLM_API_KEY=your_api_key_here
-INTENTTWIN_LLM_MIN_INTERVAL=4.2
+GEOLAB_LLM_URL=https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+GEOLAB_LLM_MODEL=your_model_id_here
+GEOLAB_LLM_API_KEY=your_api_key_here
+GEOLAB_LLM_MIN_INTERVAL=4.2
 ```
 
 Open the printed localhost URL and choose **Input item**. Six sample listings are one click away,
@@ -103,12 +104,12 @@ including a matched pair (the same earbuds described well and described vaguely)
 fastest way to see the lab separate content quality from product quality.
 
 > [!TIP]
-> `INTENTTWIN_LLM_MIN_INTERVAL` is the seconds between calls; 4.2 keeps free Gemini tiers inside quota.
+> `GEOLAB_LLM_MIN_INTERVAL` is the seconds between calls; 4.2 keeps free provider tiers inside quota.
 > On a 429 the run keeps the provider's own message, honours `Retry-After`, backs off, and stays
-> cancellable. Tune `INTENTTWIN_LLM_RATE_LIMIT_RETRIES` and `INTENTTWIN_LLM_RATE_LIMIT_BASE_DELAY`
+> cancellable. Tune `GEOLAB_LLM_RATE_LIMIT_RETRIES` and `GEOLAB_LLM_RATE_LIMIT_BASE_DELAY`
 > only if your quota needs different behaviour.
 
-Runs survive a refresh in `intenttwin.db`, and artifacts land in `data/artifacts/<run-id>/`. Deleting
+Runs survive a refresh in `geolab.db`, and artifacts land in `data/artifacts/<run-id>/`. Deleting
 the database resets the lab; export anything you want to keep first.
 
 <img src="assets/demo1.jpeg" alt="Run history listing screen and confirmation phases with their status and progress" width="100%" />
@@ -198,18 +199,17 @@ same endpoint the dashboard uses and diff the reports.
 ## Development
 
 ```bash
-uv run pytest              # unit and full-pipeline tests with a recorded provider
-uv run ruff check .        # lint
-uv run python scripts/run_smoke.py   # end-to-end run against the configured provider
+uv run pytest        # unit tests plus a full screen and confirmation run against a recorded provider
+uv run ruff check .  # lint
 ```
 
 | Path | Contents |
 | --- | --- |
-| `src/intenttwin/core.py` | Hashing, treatment rendering, retrieval channels, paired metrics. |
-| `src/intenttwin/geo.py` | Submission parsing, query and competitor generation, variants, validation. |
-| `src/intenttwin/pipeline.py` | Staged worker, provider pacing, gap report construction. |
-| `src/intenttwin/reasoning.py` | Structured-output calls and provider error handling. |
-| `src/intenttwin/web.py` | FastAPI routes, JSON status API, metric presentation. |
+| `src/geolab/core.py` | Hashing, retrieval channels, output validation, paired metrics. |
+| `src/geolab/geo.py` | Submission parsing, query and competitor generation, listing variants. |
+| `src/geolab/pipeline.py` | Staged worker, provider pacing, gap report construction. |
+| `src/geolab/reasoning.py` | Structured-output calls and provider error handling. |
+| `src/geolab/web.py` | FastAPI routes, JSON status API, metric presentation. |
 | `migrations/001_initial.sql` | The full schema. |
 
 The dashboard is server-rendered HTML with one small script that polls a status endpoint every second.

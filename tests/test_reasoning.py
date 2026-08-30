@@ -1,7 +1,7 @@
 from io import BytesIO
 from urllib.error import HTTPError
 
-from intenttwin.reasoning import _read_http_error
+from geolab.reasoning import _read_http_error
 
 
 def test_http_429_preserves_provider_detail_and_retry_after():

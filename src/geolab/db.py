@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = Path(os.getenv("INTENTTWIN_DB", ROOT / "intenttwin.db"))
+DB_PATH = Path(os.getenv("GEOLAB_DB", ROOT / "geolab.db"))
 
 
 def connect() -> sqlite3.Connection:

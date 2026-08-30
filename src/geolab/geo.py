@@ -203,6 +203,20 @@ def _build_misleading_body(product: dict[str, Any], facts: list[dict[str, Any]])
     return body.replace(_format_value(target), _format_value({**target, "value": false_value}), 1)
 
 
+def render_presentation(product: dict[str, Any], condition: str) -> dict[str, Any]:
+    """Present an untouched catalogue product under one experiment condition."""
+    body = product["original_presentation"].replace("\r\n", "\n")
+    return {
+        "presentation_id": f"{product['product_id']}:{condition}:v1",
+        "product_id": product["product_id"],
+        "condition": condition,
+        "title": product["name"],
+        "body": body,
+        "exposed_fact_ids": [fact["fact_id"] for fact in product["facts"] if fact_is_exposed(fact, body)],
+        "content_hash": stable_hash(body),
+    }
+
+
 def is_control(condition: str) -> bool:
     return condition in CONTROL_CONDITIONS
 

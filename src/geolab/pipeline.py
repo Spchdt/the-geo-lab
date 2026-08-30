@@ -6,21 +6,17 @@ import json
 import os
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 from .core import (
     ANALYSIS_SEED,
-    CONDITIONS,
     RRF_K,
     assert_competitors_unchanged,
     canonical_json,
     check_constraint,
     compute_paired_metrics,
     fuse_ranks,
-    load_jsonl,
     rank_channels,
-    render_treatment,
     stable_hash,
     tokenize,
     treatment_claim_errors,
@@ -34,19 +30,14 @@ from .geo import (
     generate_queries,
     generate_variants,
     is_control,
+    render_presentation,
     submission_form,
     validate_summary,
 )
 from .reasoning import LLMRequestError, llm_config, recommend, summarize_gap_report
 
+IDENTITY_CONDITION = "identity_control"
 STAGES = ("validate", "materialize", "retrieve", "reason", "validate_outputs", "analyze", "complete")
-LLM_CONDITIONS = CONDITIONS
-RUN_PROFILES = {
-    "smoke": {"source_suite": "diagnostic", "limit": 12, "trials": 1, "evidence_level": "directional smoke test"},
-    "diagnostic": {"source_suite": "diagnostic", "limit": None, "trials": 3, "evidence_level": "descriptive diagnostic"},
-    "demand": {"source_suite": "demand", "limit": None, "trials": 3, "evidence_level": "descriptive independent demand"},
-    "sealed": {"source_suite": "sealed", "limit": None, "trials": 3, "evidence_level": "descriptive sealed confirmation"},
-}
 DEFAULT_MIN_INTERVAL_SECONDS = "4.2"
 DEFAULT_RATE_LIMIT_RETRIES = "8"
 DEFAULT_RATE_LIMIT_BASE_DELAY = "5"
@@ -64,74 +55,11 @@ _worker_lock = threading.Lock()
 _last_llm_call_at = 0.0
 
 
-def resolve_catalogue_path() -> Path:
-    return ROOT / "data" / "catalogue.jsonl"
-
-
-def resolve_suite_path(suite: str) -> Path:
-    return ROOT / "data" / "suites" / f"{suite}.jsonl"
-
-
-def load_fixture() -> None:
-    migrate()
-    products = load_jsonl(resolve_catalogue_path())
-    queries = [query for suite in ("diagnostic", "demand", "sealed") for query in load_jsonl(resolve_suite_path(suite))]
-    catalogue_hash = stable_hash(products)
-    with connect() as db:
-        db.execute("INSERT OR REPLACE INTO catalogues(id, content_hash) VALUES(?,?)", ("power-banks-v2", catalogue_hash))
-        for product in products:
-            db.execute("INSERT OR REPLACE INTO products VALUES(?,?,?)", (product["product_id"], "power-banks-v2", canonical_json(product)))
-            for fact in product["facts"]:
-                db.execute("INSERT OR REPLACE INTO facts VALUES(?,?,?,?,?,?)", (fact["fact_id"], product["product_id"], fact["predicate"], canonical_json(fact["value"]), fact.get("unit"), fact["status"]))
-        db.execute("DELETE FROM query_groups")
-        for query in queries:
-            db.execute("INSERT OR REPLACE INTO query_groups VALUES(?,?,?,?)", (query["query_group_id"], query["suite"], canonical_json(query), stable_hash(query)))
-
-
-def create_run(put_id: str = "pb-017", suite: str = "smoke", parent_run_id: int | None = None) -> int:
-    if suite not in RUN_PROFILES:
-        raise ValueError(f"unknown run profile: {suite}")
-    config = llm_config()
-    load_fixture()
-    profile = RUN_PROFILES[suite]
-    suite_rows = load_jsonl(resolve_suite_path(profile["source_suite"]))
-    if profile["limit"]:
-        suite_rows = suite_rows[:profile["limit"]]
-    if suite == "sealed" and parent_run_id is None:
-        with connect() as db:
-            locked = db.execute("SELECT id FROM runs WHERE put_product_id=? AND suite='demand' AND status='passed' AND locked=1 ORDER BY id DESC LIMIT 1", (put_id,)).fetchone()
-        if not locked:
-            raise ValueError("sealed confirmation requires a passed, locked demand revision")
-        parent_run_id = int(locked["id"])
-    products = load_jsonl(resolve_catalogue_path())
-    manifest = {
-        "catalogue_hash": stable_hash(products),
-        "truth_hash": stable_hash([{key: product[key] for key in ("product_id", "facts")} for product in products]),
-        "suite_hash": stable_hash(suite_rows),
-        "put_product_id": put_id,
-        "conditions": CONDITIONS,
-        "retrieval": RETRIEVAL_MANIFEST,
-        "recommendation_model": config["model"],
-        "llm_policy": {"mode": "all_conditions", "conditions": LLM_CONDITIONS, "trials": profile["trials"], "maximum_calls": len(suite_rows) * len(LLM_CONDITIONS) * profile["trials"]},
-        "query_groups": len(suite_rows),
-        "trials": profile["trials"],
-        "evidence_level": profile["evidence_level"],
-        "interpretation": "descriptive_not_confirmatory",
-        "analysis_seed": ANALYSIS_SEED,
-    }
-    with connect() as db:
-        cursor = db.execute("INSERT INTO runs(put_product_id,suite,manifest_hash,manifest_json,parent_run_id) VALUES(?,?,?,?,?)", (put_id, suite, stable_hash(manifest), canonical_json(manifest), parent_run_id))
-        run_id = int(cursor.lastrowid)
-        db.executemany("INSERT INTO run_jobs(run_id,stage,position) VALUES(?,?,?)", [(run_id, stage, position) for position, stage in enumerate(STAGES)])
-    start_worker()
-    return run_id
-
-
 def create_geo_run(form: dict[str, str], phase: str = "screen", parent_run_id: int | None = None, promoted_conditions: list[str] | None = None) -> int:
     if phase not in {"screen", "confirmation"}:
         raise ValueError("unknown GEO phase")
     config = llm_config()
-    load_fixture()
+    migrate()
     product = build_product_submission(form)
     queries = generate_queries(product, phase)
     variants = generate_variants(product)
@@ -240,7 +168,7 @@ def wait_with_cancel(run_id: int, seconds: float) -> bool:
 
 def wait_for_llm_slot(run_id: int) -> bool:
     global _last_llm_call_at
-    interval = max(0.0, float(os.getenv("INTENTTWIN_LLM_MIN_INTERVAL", DEFAULT_MIN_INTERVAL_SECONDS)))
+    interval = max(0.0, float(os.getenv("GEOLAB_LLM_MIN_INTERVAL", DEFAULT_MIN_INTERVAL_SECONDS)))
     remaining = interval - (time.monotonic() - _last_llm_call_at)
     if remaining > 0:
         append_log(run_id, "reason", f"Pacing provider calls · waiting {remaining:.1f}s")
@@ -300,22 +228,13 @@ def load_run_context(run_id: int) -> tuple[dict[str, Any], dict[str, dict[str, A
     with connect() as db:
         run = dict(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
         manifest = json.loads(run["manifest_json"])
-        if manifest.get("experiment_version") == "geo-gap-v1":
-            product_rows = manifest["competitor_snapshots"] + [manifest["product_snapshot"]]
-            products = {row["product_id"]: row for row in product_rows}
-            queries = manifest["queries"]
-        else:
-            products = {row["product_id"]: row for row in load_jsonl(resolve_catalogue_path())}
-            profile = RUN_PROFILES[run["suite"]]
-            queries = [json.loads(row["data_json"]) for row in db.execute("SELECT * FROM query_groups WHERE suite=? ORDER BY query_group_id", (profile["source_suite"],))]
-            if profile["limit"]:
-                queries = queries[:profile["limit"]]
-    return run, products, queries
+    products = {row["product_id"]: row for row in manifest["competitor_snapshots"] + [manifest["product_snapshot"]]}
+    return run, products, manifest["queries"]
 
 
 def read_run_conditions(run: dict[str, Any]) -> tuple[str, ...]:
     manifest = json.loads(run["manifest_json"])
-    return tuple(manifest.get("conditions", CONDITIONS))
+    return tuple(manifest["conditions"])
 
 
 def stage_validate(run_id: int) -> None:
@@ -332,23 +251,19 @@ def stage_materialize(run_id: int) -> None:
     put_id = run["put_product_id"]
     manifest = json.loads(run["manifest_json"])
     conditions = read_run_conditions(run)
-    variant_by_condition = {variant["condition"]: variant for variant in manifest.get("variants", [])}
+    variant_by_condition = {variant["condition"]: variant for variant in manifest["variants"]}
     presentations = []
     for condition in conditions:
         for product in products.values():
-            if product["product_id"] == put_id and variant_by_condition:
+            if product["product_id"] == put_id:
                 variant = variant_by_condition[condition]
                 item = {
                     "presentation_id": f"{product['product_id']}:{condition}:v1",
                     "product_id": product["product_id"], "condition": condition, "title": product["name"],
                     "body": variant["body"], "exposed_fact_ids": variant["exposed_fact_ids"], "content_hash": variant["content_hash"],
                 }
-            elif variant_by_condition:
-                item = render_treatment(product, product["original_presentation"], "original", False)
-                item["condition"] = condition
-                item["presentation_id"] = f"{product['product_id']}:{condition}:v1"
             else:
-                item = render_treatment(product, product["original_presentation"], condition, product["product_id"] == put_id)
+                item = render_presentation(product, condition)
             errors = treatment_claim_errors(product, item)
             if errors and condition != "misleading_control":
                 raise ValueError(errors[0])
@@ -357,8 +272,7 @@ def stage_materialize(run_id: int) -> None:
             presentations.append(item)
     assert_competitors_unchanged(presentations, put_id)
     originals = {item["product_id"]: item for item in presentations if item["condition"] == "original"}
-    identity_condition = "identity_control" if "identity_control" in conditions else "identity_copy"
-    identity = {item["product_id"]: item for item in presentations if item["condition"] == identity_condition}
+    identity = {item["product_id"]: item for item in presentations if item["condition"] == IDENTITY_CONDITION}
     if identity and any(originals[key]["body"] != identity[key]["body"] for key in originals):
         raise ValueError("identity treatment differs")
     with connect() as db:
@@ -395,8 +309,7 @@ def stage_retrieve(run_id: int) -> None:
                     outcome, reasons = check_constraint(product, query["hard_constraints"])
                     db.execute("INSERT OR REPLACE INTO constraint_traces VALUES(?,?,?,?,?,?)", (run_id, query["query_group_id"], condition, product["product_id"], outcome, canonical_json(reasons)))
         original = db.execute("SELECT query_group_id,product_id,rank FROM retrieval_traces WHERE run_id=? AND condition='original' AND channel='fused' ORDER BY query_group_id,rank", (run_id,)).fetchall()
-        identity_condition = "identity_control" if "identity_control" in conditions else "identity_copy"
-        identity = db.execute("SELECT query_group_id,product_id,rank FROM retrieval_traces WHERE run_id=? AND condition=? AND channel='fused' ORDER BY query_group_id,rank", (run_id, identity_condition)).fetchall()
+        identity = db.execute("SELECT query_group_id,product_id,rank FROM retrieval_traces WHERE run_id=? AND condition=? AND channel='fused' ORDER BY query_group_id,rank", (run_id, IDENTITY_CONDITION)).fetchall()
         if identity and [tuple(row) for row in original] != [tuple(row) for row in identity]:
             raise ValueError("identity-copy retrieval differs")
 
@@ -404,7 +317,7 @@ def stage_retrieve(run_id: int) -> None:
 def stage_reason(run_id: int) -> None:
     run, products, queries = load_run_context(run_id)
     manifest = json.loads(run["manifest_json"])
-    llm_conditions = tuple(manifest.get("llm_policy", {}).get("conditions", LLM_CONDITIONS))
+    llm_conditions = tuple(manifest["llm_policy"]["conditions"])
     trials = manifest["trials"]
     eligible_queries = [query for query in queries if check_constraint(products[run["put_product_id"]], query["hard_constraints"])[0] == "PASS"]
     total = len(eligible_queries) * len(llm_conditions) * trials
@@ -449,7 +362,7 @@ def stage_reason(run_id: int) -> None:
                 else:
                     attempt_number = 0
                     rate_limit_count = 0
-                    rate_limit_retries = max(0, int(os.getenv("INTENTTWIN_LLM_RATE_LIMIT_RETRIES", DEFAULT_RATE_LIMIT_RETRIES)))
+                    rate_limit_retries = max(0, int(os.getenv("GEOLAB_LLM_RATE_LIMIT_RETRIES", DEFAULT_RATE_LIMIT_RETRIES)))
                     while attempt_number < MAX_TRANSPORT_ATTEMPTS:
                         if not wait_for_llm_slot(run_id):
                             return
@@ -459,7 +372,7 @@ def stage_reason(run_id: int) -> None:
                             break
                         except LLMRequestError as exc:
                             if exc.status_code == 429 and rate_limit_count < rate_limit_retries:
-                                base_delay = max(0.0, float(os.getenv("INTENTTWIN_LLM_RATE_LIMIT_BASE_DELAY", DEFAULT_RATE_LIMIT_BASE_DELAY)))
+                                base_delay = max(0.0, float(os.getenv("GEOLAB_LLM_RATE_LIMIT_BASE_DELAY", DEFAULT_RATE_LIMIT_BASE_DELAY)))
                                 delay = exc.retry_after if exc.retry_after is not None else min(MAX_BACKOFF_SECONDS, base_delay * (2 ** rate_limit_count))
                                 rate_limit_count += 1
                                 append_log(run_id, "reason", f"Rate limited ({rate_limit_count}/{rate_limit_retries}): {exc} · waiting {delay:.1f}s before resuming")
@@ -569,12 +482,12 @@ def build_gap_report(run_id: int, run: dict[str, Any], product: dict[str, Any], 
     best = candidates[0] if candidates else baseline
     winner = best if best.get("retrieval_mrr_delta", 0) > 0 or best.get("top3_delta", 0) > 0 or best.get("recommendation_mrr_delta", 0) > 0 else baseline
     retrieval_up = winner.get("retrieval_mrr_delta", 0) > 0
-    gemini_up = winner.get("top3_delta", 0) > 0 or winner.get("recommendation_mrr_delta", 0) > 0
-    if retrieval_up and gemini_up:
+    agent_up = winner.get("top3_delta", 0) > 0 or winner.get("recommendation_mrr_delta", 0) > 0
+    if retrieval_up and agent_up:
         evidence_status = "supported"
     elif retrieval_up:
         evidence_status = "discoverability_gap"
-    elif gemini_up:
+    elif agent_up:
         evidence_status = "persuasion_gap"
     else:
         evidence_status = "mixed_or_inconclusive"
@@ -631,7 +544,7 @@ def build_gap_report(run_id: int, run: dict[str, Any], product: dict[str, Any], 
 
 
 def build_variant_explanations(run_id: int, product_id: str, metrics: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Explain each variant using only paired retrieval and Gemini results from this run."""
+    """Explain each variant using only paired retrieval and assistant results from this run."""
     with connect() as db:
         retrieval_rows = db.execute(
             "SELECT query_group_id,condition,rank FROM retrieval_traces "
@@ -645,11 +558,11 @@ def build_variant_explanations(run_id: int, product_id: str, metrics: list[dict[
         ).fetchall()
 
     retrieval_ranks = {(row["condition"], row["query_group_id"]): row["rank"] for row in retrieval_rows}
-    gemini_scores: dict[tuple[str, str], list[float]] = {}
+    agent_scores: dict[tuple[str, str], list[float]] = {}
     for row in attempt_rows:
         ordered = json.loads(row["response_json"]).get("ordered_product_ids", [])
         rank = ordered.index(product_id) + 1 if product_id in ordered else None
-        gemini_scores.setdefault((row["condition"], row["query_group_id"]), []).append(1 / rank if rank else 0)
+        agent_scores.setdefault((row["condition"], row["query_group_id"]), []).append(1 / rank if rank else 0)
 
     def paired_query_ids(condition: str, source: dict[tuple[str, str], Any]) -> tuple[list[str], list[str]]:
         query_ids = sorted(query_id for candidate, query_id in source if candidate == "original")
@@ -674,31 +587,31 @@ def build_variant_explanations(run_id: int, product_id: str, metrics: list[dict[
     for metric in metrics:
         condition = metric["condition"]
         retrieval_up, retrieval_down = paired_query_ids(condition, retrieval_ranks)
-        gemini_up, gemini_down = paired_query_ids(condition, gemini_scores)
+        agent_up, agent_down = paired_query_ids(condition, agent_scores)
         retrieval_delta = metric.get("retrieval_mrr_delta", 0)
-        gemini_delta = metric.get("top3_delta", 0)
+        agent_delta = metric.get("top3_delta", 0)
         if condition == "original":
             summary = "Baseline submitted listing used for every paired comparison."
         elif condition == "identity_control":
-            summary = "Null control: identical listing text; any Gemini difference is model variability, not a content effect."
+            summary = "Null control: identical listing text; any difference in the assistant's answer is model variability, not a content effect."
         elif condition == "misleading_control":
             summary = "Safety control with a deliberately false claim; it is validation evidence and cannot win."
-        elif retrieval_delta > 0 and gemini_delta > 0:
-            summary = "Improved both retrieval discoverability and Gemini top-three selection versus the original."
+        elif retrieval_delta > 0 and agent_delta > 0:
+            summary = "Improved both retrieval discoverability and top-three selection by the assistant versus the original."
         elif retrieval_delta > 0:
-            summary = "Improved retrieval, but Gemini top-three selection did not improve."
-        elif gemini_delta > 0:
-            summary = "Improved Gemini top-three selection without a retrieval gain."
-        elif retrieval_delta < 0 and gemini_delta < 0:
-            summary = "Performed worse than the original in both retrieval and Gemini top-three selection."
+            summary = "Improved retrieval, but top-three selection by the assistant did not improve."
+        elif agent_delta > 0:
+            summary = "Improved top-three selection by the assistant without a retrieval gain."
+        elif retrieval_delta < 0 and agent_delta < 0:
+            summary = "Performed worse than the original in both retrieval and top-three selection by the assistant."
         else:
-            summary = "No clear overall gain; the retrieval and Gemini signals were tied or mixed."
+            summary = "No clear overall gain; the retrieval and assistant signals were tied or mixed."
         explanations[condition] = {
             "summary": summary,
             "retrieval_improved_query_ids": retrieval_up,
             "retrieval_worsened_query_ids": retrieval_down,
-            "gemini_improved_query_ids": gemini_up,
-            "gemini_worsened_query_ids": gemini_down,
+            "agent_improved_query_ids": agent_up,
+            "agent_worsened_query_ids": agent_down,
         }
     return explanations
 
@@ -732,11 +645,11 @@ def build_human_explanation(report: dict[str, Any], manifest: dict[str, Any]) ->
         return ", ".join(found[:-1]) + (f" and {found[-1]}" if len(found) > 1 else found[0])
 
     retrieval_delta = float(metrics.get("retrieval_mrr_delta") or 0)
-    gemini_top3_delta = float(metrics.get("top3_delta") or 0)
+    agent_top3_delta = float(metrics.get("top3_delta") or 0)
     retrieval_up_ids = evidence.get("retrieval_improved_query_ids", [])
     retrieval_down_ids = evidence.get("retrieval_worsened_query_ids", [])
-    gemini_up_ids = evidence.get("gemini_improved_query_ids", [])
-    gemini_down_ids = evidence.get("gemini_worsened_query_ids", [])
+    agent_up_ids = evidence.get("agent_improved_query_ids", [])
+    agent_down_ids = evidence.get("agent_worsened_query_ids", [])
 
     if winner == "original":
         return [
@@ -744,14 +657,14 @@ def build_human_explanation(report: dict[str, Any], manifest: dict[str, Any]) ->
             {"label": "What it means", "text": "None of the rewrites made the product clearly easier to find and more likely to be recommended."},
         ]
 
-    if retrieval_delta > 0 and gemini_top3_delta > 0:
+    if retrieval_delta > 0 and agent_top3_delta > 0:
         result = "This version was easier to find and more likely to be recommended."
-    elif retrieval_delta > 0 and gemini_top3_delta < 0:
+    elif retrieval_delta > 0 and agent_top3_delta < 0:
         result = "This version was easier to find, but less likely to be recommended."
     elif retrieval_delta > 0:
         result = "This version was easier to find, but no more likely to be recommended."
-    elif gemini_top3_delta > 0:
-        result = "This version was harder to find, but more convincing once Gemini saw it."
+    elif agent_top3_delta > 0:
+        result = "This version was harder to find, but more convincing once the assistant saw it."
     else:
         result = "This version did not clearly improve on the original listing."
 
@@ -766,13 +679,13 @@ def build_human_explanation(report: dict[str, Any], manifest: dict[str, Any]) ->
     else:
         why = "The rewrite did not help the product move up in the tested searches."
 
-    if retrieval_delta > 0 and gemini_top3_delta < 0:
-        meaning = f"The wording matched shopper searches better, but Gemini ranked it lower on {len(gemini_down_ids)} of {query_count} searches. The product became more visible, but the listing was not convincing enough against competitors."
-    elif retrieval_delta > 0 and gemini_top3_delta > 0:
-        meaning = f"The change helped shoppers find the product and helped Gemini prefer it on {len(gemini_up_ids)} of {query_count} searches."
+    if retrieval_delta > 0 and agent_top3_delta < 0:
+        meaning = f"The wording matched shopper searches better, but the assistant ranked it lower on {len(agent_down_ids)} of {query_count} searches. The product became more visible, but the listing was not convincing enough against competitors."
+    elif retrieval_delta > 0 and agent_top3_delta > 0:
+        meaning = f"The change helped shoppers find the product and helped the assistant prefer it on {len(agent_up_ids)} of {query_count} searches."
     elif retrieval_delta > 0:
-        meaning = "The change helped discovery only. Once Gemini compared products, it found no stronger reason to choose this one."
-    elif gemini_top3_delta > 0:
+        meaning = "The change helped discovery only. Once the assistant compared products, it found no stronger reason to choose this one."
+    elif agent_top3_delta > 0:
         meaning = "The listing was persuasive when seen, but it needs clearer search language so it can be found more reliably."
     else:
         meaning = "The tested change did not solve a clear product-listing gap."

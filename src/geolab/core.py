@@ -6,7 +6,6 @@ import math
 import random
 import re
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
@@ -15,7 +14,6 @@ SEMANTIC_DIMENSIONS = 128
 RRF_K = 60
 BOOTSTRAP_SAMPLES = 1000
 ANALYSIS_SEED = 20260829
-CONDITIONS = ("original", "normalized", "grounded_enriched", "identity_copy", "misleading_control")
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -28,10 +26,6 @@ def stable_hash(value: Any) -> str:
     if isinstance(raw, str):
         raw = raw.encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
-
-
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 def index_facts_by_predicate(product: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -63,39 +57,6 @@ def fact_is_exposed(fact: dict[str, Any], text: str) -> bool:
     return bool(unit and re.search(rf"{bounded}\s*{unit}\b", text, re.IGNORECASE))
 
 
-def render_treatment(product: dict[str, Any], original: str, condition: str, is_put: bool) -> dict[str, Any]:
-    if not is_put or condition in {"original", "identity_copy"}:
-        body = original.replace("\r\n", "\n") if condition != "identity_copy" else original
-        exposed = [fact["fact_id"] for fact in product["facts"] if fact_is_exposed(fact, body)]
-    else:
-        facts = index_facts_by_predicate(product)
-        exposed = [f["fact_id"] for f in product["facts"] if f["status"] == "verified"]
-        if condition == "normalized":
-            exposed_facts = [f for f in product["facts"] if fact_is_exposed(f, original)]
-            exposed = [f["fact_id"] for f in exposed_facts]
-        else:
-            exposed_facts = [f for f in product["facts"] if f["status"] == "verified"]
-        title = product["name"]
-        labels = {"capacity": "Capacity", "price": "Price", "weight": "Weight", "ports": "Ports"}
-        lines = []
-        for fact in exposed_facts:
-            value = f"{fact['value']:,}" if isinstance(fact["value"], int) else f"{fact['value']:.2f}"
-            lines.append(f"{labels.get(fact['predicate'], fact['predicate'].title())}: {value} {fact['unit']}")
-        body = "\n".join([title, *lines])
-        if condition == "misleading_control":
-            capacity = facts["capacity"]
-            body = body.replace(f"{capacity['value']:,}", f"{capacity['value'] + 10000:,}")
-    return {
-        "presentation_id": f"{product['product_id']}:{condition}:v1",
-        "product_id": product["product_id"],
-        "condition": condition,
-        "title": product["name"],
-        "body": body,
-        "exposed_fact_ids": exposed,
-        "content_hash": stable_hash(body),
-    }
-
-
 def assert_competitors_unchanged(presentations: list[dict[str, Any]], put_id: str) -> None:
     hashes: dict[str, set[str]] = defaultdict(set)
     for item in presentations:
@@ -109,9 +70,6 @@ def assert_competitors_unchanged(presentations: list[dict[str, Any]], put_id: st
 def treatment_claim_errors(product: dict[str, Any], presentation: dict[str, Any]) -> list[str]:
     fact_ids = {fact["fact_id"] for fact in product["facts"]}
     errors = [fact_id for fact_id in presentation["exposed_fact_ids"] if fact_id not in fact_ids]
-    if presentation["condition"] == "normalized" and product.get("original_presentation"):
-        allowed = {fact["fact_id"] for fact in product["facts"] if fact_is_exposed(fact, product["original_presentation"])}
-        errors.extend(f"normalized fact absent from original: {fact_id}" for fact_id in presentation["exposed_fact_ids"] if fact_id not in allowed)
     if presentation["condition"] == "misleading_control":
         exposed = [fact for fact in product["facts"] if fact["fact_id"] in presentation["exposed_fact_ids"]]
         if any(not fact_is_exposed(fact, presentation["body"]) for fact in exposed):
@@ -217,7 +175,7 @@ def compute_paired_metrics(rows: Iterable[dict[str, Any]], put_id: str, seed: in
     original = {qid: {key: average(values["original"], key) for key in ("any", "top1", "top3", "mrr")} for qid, values in grouped.items() if values.get("original")}
     rng = random.Random(seed)
     result = []
-    ordered_conditions = list(conditions) if conditions is not None else (seen_conditions or list(CONDITIONS))
+    ordered_conditions = list(conditions) if conditions is not None else seen_conditions
     for condition in ordered_conditions:
         pairs = [(original[qid], {key: average(values[condition], key) for key in ("any", "top1", "top3", "mrr")}) for qid, values in grouped.items() if qid in original and values.get(condition)]
         deltas = [b["any"] - a["any"] for a, b in pairs]
