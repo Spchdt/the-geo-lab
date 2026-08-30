@@ -1,0 +1,20 @@
+{% extends "base.html" %}{% block content %}
+<section class="toolbar"><div><h1>GEO experiments</h1><p>{% if llm_ready %}Gemini configured · each screen variant reaches the model{% else %}<strong>Gemini not configured. Runs disabled.</strong>{% endif %}</p></div><button type="button" id="toggle-product-form">Input item</button></section>
+<section class="panel experiment-form" id="product-form-panel" hidden>
+  <div class="panel-heading"><div><h2>Test a marketplace listing</h2><p>Works with any item category. Enter the current listing and the canonical facts your brand can support.</p></div><span class="status pending">generic-marketplace-v1</span></div>
+  <div class="sample-actions"><span>Try an example:</span><button type="button" class="secondary" data-sample="strong">Detailed earbuds</button><button type="button" class="secondary" data-sample="weak">Vague earbuds</button><button type="button" class="secondary" data-sample="shoes">Running shoes</button><button type="button" class="secondary" data-sample="chair">Office chair</button><button type="button" class="secondary" data-sample="serum">Skincare serum</button><button type="button" class="secondary" data-sample="backpack">Travel backpack</button></div>
+  <form method="post" action="/runs">
+    <div class="form-grid">
+      <label>Product name<input name="product_name" required placeholder="Example: Nimbus Buds"></label>
+      <label>Marketplace category<input name="category" required placeholder="Example: wireless earbuds"></label>
+      <label>Current listing title<input name="listing_title" required placeholder="Current marketplace title"></label>
+      <label class="wide">Current listing description<textarea name="listing_description" required rows="4" placeholder="Paste the current description exactly as listed"></textarea></label>
+      <label>Price (SGD)<input name="price" required type="number" min="0.01" step="0.01"></label>
+    </div>
+    <div class="attributes-heading"><div><strong>Product attributes</strong><p>Add facts shoppers may search or compare. “Better when” controls relevant constraint wording.</p></div><button type="button" class="secondary" id="add-attribute">Add attribute</button></div>
+    <div id="attribute-rows" class="attribute-rows"></div>
+    <div class="form-actions"><p>Starts a 6-query directional screen. Results stay inside the controlled catalogue.</p><button {% if not llm_ready %}disabled title="Configure Gemini environment variables first"{% endif %}>Start GEO screen</button></div>
+  </form>
+</section>
+<section class="panel"><h2>Runs</h2><table><thead><tr><th>Run</th><th>Product</th><th>Phase</th><th>Model</th><th>Status</th><th>Progress</th><th>Created</th></tr></thead><tbody>{% for run in runs %}<tr><td><a href="/runs/{{ run.id }}">#{{ run.id }}</a></td><td>{{ run.product_name or run.put_product_id }}</td><td>{{ run.phase or run.suite }}</td><td>{{ run.model }}</td><td><span class="status {{ run.status }}">{{ run.status }}</span></td><td><div class="bar"><i style="width:{{ run.progress }}%"></i></div>{{ run.progress }}%</td><td>{{ run.created_at }}</td></tr>{% else %}<tr><td colspan="7">No runs. Start one.</td></tr>{% endfor %}</tbody></table></section>
+{% endblock %}

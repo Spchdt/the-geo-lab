@@ -1,0 +1,10 @@
+.venv/
+.env
+*.db
+*.db-shm
+*.db-wal
+data/artifacts/*
+!data/artifacts/.gitkeep
+__pycache__/
+.pytest_cache/
+.DS_Store
