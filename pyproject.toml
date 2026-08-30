@@ -3,6 +3,8 @@ name = "intenttwin"
 version = "0.1.0"
 description = "Local closed-catalogue listing treatment experiment"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["fastapi>=0.115", "jinja2>=3.1", "numpy>=1.24", "uvicorn>=0.30"]
 
 [project.optional-dependencies]

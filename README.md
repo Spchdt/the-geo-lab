@@ -6,13 +6,13 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-server--rendered-009688?logo=fastapi&logoColor=white)](./src/intenttwin/web.py)
 [![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)](./migrations/001_initial.sql)
 [![Tests](https://img.shields.io/badge/tests-pytest-0A9EDC?logo=pytest&logoColor=white)](./tests)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 Paste a product listing. The GEO Lab rewrites it several ways, drops every version into the same
 synthetic marketplace against the same 30 competitors, asks a shopping agent on every version of every
 query which product it would recommend, then reports which rewrite won and which queries moved.
 
-<!-- assets/hero-run-report.png: gap report for a completed screen run -->
-<img src="assets/hero-run-report.png" alt="The GEO Lab gap report" width="100%" />
+<img src="assets/demo3.jpeg" alt="Gap report for a completed screen run: winner, evidence, recommended action, and the original listing beside the best tested rewrite" width="100%" />
 
 > [!NOTE]
 > Every number comes from a controlled catalogue and one configured model. The lab measures whether a
@@ -30,6 +30,7 @@ query which product it would recommend, then reports which rewrite won and which
 - [Beyond one category](#beyond-one-category)
 - [Adoption path for a brand](#adoption-path-for-a-brand)
 - [Development](#development)
+- [License](#license)
 - [Limitations](#limitations)
 
 ## The gap we are solving
@@ -46,9 +47,6 @@ can fail at either one:
 Brands have no way to tell which half is broken. Rewriting a description and watching sales tells you
 nothing, because traffic, price, season, and the assistant's own variance all move at once. The GEO
 Lab holds everything constant except the listing text, so the difference that remains is the content.
-
-<!-- assets/retrieval-vs-selection.png: diagram of the two failure stages -->
-<img src="assets/retrieval-vs-selection.png" alt="Retrieval and selection are separate failures" width="100%" />
 
 ## How it works
 
@@ -113,6 +111,8 @@ fastest way to see the lab separate content quality from product quality.
 Runs survive a refresh in `intenttwin.db`, and artifacts land in `data/artifacts/<run-id>/`. Deleting
 the database resets the lab; export anything you want to keep first.
 
+<img src="assets/demo1.jpeg" alt="Run history listing screen and confirmation phases with their status and progress" width="100%" />
+
 ## Anatomy of a run
 
 A submission becomes ten listings that all state the truth, plus two that exist to catch lying
@@ -133,9 +133,6 @@ The screen phase runs 6 generated queries across every variant, costing at most 
 calls plus one summary call. The two strongest variants are then promoted into a confirmation phase
 on 12 held-out queries they have never seen, against the original and the identity control: 48 calls
 plus a summary. A variant that only won by fitting the screen queries does not survive that.
-
-<!-- assets/variant-comparison-table.png: variant comparison panel from a finished run -->
-<img src="assets/variant-comparison-table.png" alt="Variant comparison table" width="100%" />
 
 ## What gets measured
 
@@ -227,3 +224,7 @@ No build step, no bundler, no framework.
   phase exists because the screen alone is not enough evidence.
 - Results are descriptive. Sample sizes, margins, and decision rules would need to be fixed in advance
   before any run could be called confirmatory.
+
+## License
+
+Released under the [MIT License](./LICENSE).

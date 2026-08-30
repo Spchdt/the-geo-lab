@@ -251,13 +251,16 @@ def wait_for_llm_slot(run_id: int) -> bool:
 
 
 def work_once() -> None:
+    """Take the oldest queued run through every stage, then hand off to the next one."""
     if not _worker_lock.acquire(blocking=False):
         return
+    claimed_run = False
     try:
         with connect() as db:
             row = db.execute("SELECT id FROM runs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
             if not row:
                 return
+            claimed_run = True
             run_id = row["id"]
             db.execute("UPDATE runs SET status='running',started_at=CURRENT_TIMESTAMP WHERE id=?", (run_id,))
         for position, stage in enumerate(STAGES):
@@ -287,7 +290,10 @@ def work_once() -> None:
             time.sleep(STAGE_PAUSE_SECONDS)
     finally:
         _worker_lock.release()
-        start_worker()
+        # Only chain when this call actually held a run; respawning on an empty
+        # queue spins a new thread per iteration forever.
+        if claimed_run:
+            start_worker()
 
 
 def load_run_context(run_id: int) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]]]:
