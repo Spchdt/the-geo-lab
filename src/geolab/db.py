@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""SQLite access helpers shared by the pipeline and the web layer."""
 
 import json
 import os
@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = Path(os.getenv("INTENTTWIN_DB", ROOT / "intenttwin.db"))
+DB_PATH = Path(os.getenv("GEOLAB_DB", ROOT / "geolab.db"))
 
 
 def connect() -> sqlite3.Connection:
@@ -24,18 +24,18 @@ def migrate() -> None:
         db.executescript((ROOT / "migrations" / "001_initial.sql").read_text())
 
 
-def one(sql: str, args: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+def fetch_one(sql: str, args: tuple[Any, ...] = ()) -> dict[str, Any] | None:
     with connect() as db:
         row = db.execute(sql, args).fetchone()
         return dict(row) if row else None
 
 
-def all(sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+def fetch_all(sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     with connect() as db:
         return [dict(row) for row in db.execute(sql, args).fetchall()]
 
 
-def decode(row: dict[str, Any], *fields: str) -> dict[str, Any]:
+def decode_json_fields(row: dict[str, Any], *fields: str) -> dict[str, Any]:
     for field in fields:
         if row.get(field):
             row[field] = json.loads(row[field])

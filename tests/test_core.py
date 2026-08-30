@@ -1,8 +1,14 @@
-import json
 
-from intenttwin.core import (assert_competitors_unchanged, check_constraint, fuse,
-                             paired_metrics, render_treatment, stable_hash,
-                             treatment_claim_errors, validate_recommendation)
+import pytest
+
+from geolab.core import (
+    assert_competitors_unchanged,
+    check_constraint,
+    compute_paired_metrics,
+    fuse_ranks,
+    stable_hash,
+    validate_recommendation,
+)
 
 
 def product(pid="pb-017", capacity=20000):
@@ -18,35 +24,10 @@ def test_canonical_hash_is_stable():
     assert stable_hash({"b": 2, "a": 1}) == stable_hash({"a": 1, "b": 2})
 
 
-def test_identity_treatment_is_byte_equal():
-    original = "Exact\r\nbytes"
-    assert render_treatment(product(), original, "identity_copy", True)["body"] == original
-
-
-def test_normalized_does_not_infer_one_port_from_ten_thousand_capacity():
-    p = product(pid="pb-009", capacity=10000)
-    p["facts"][-1]["value"] = 1
-    p["original_presentation"] = "VoltPack 9 10,000 mAh Power Bank\nSGD 89.00."
-    normalized = render_treatment(p, p["original_presentation"], "normalized", True)
-    assert normalized["exposed_fact_ids"] == ["pb-009:capacity", "pb-009:price"]
-    assert "Ports:" not in normalized["body"]
-
-    explicit = render_treatment(p, p["original_presentation"] + "\n1 USB port.", "normalized", True)
-    assert "pb-009:ports" in explicit["exposed_fact_ids"]
-    assert "Ports: 1 count" in explicit["body"]
-
-
 def test_competitor_mutation_fails_run():
     rows = [{"product_id": "other", "content_hash": "a"}, {"product_id": "other", "content_hash": "b"}]
-    try: assert_competitors_unchanged(rows, "put")
-    except ValueError: pass
-    else: raise AssertionError("mutation accepted")
-
-
-def test_misleading_control_detected():
-    p = product()
-    item = render_treatment(p, "Test 20,000 mAh SGD 89.00", "misleading_control", True)
-    assert treatment_claim_errors(p, item)
+    with pytest.raises(ValueError):
+        assert_competitors_unchanged(rows, "put")
 
 
 def test_constraint_pass_fail_unknown():
@@ -57,7 +38,7 @@ def test_constraint_pass_fail_unknown():
 
 
 def test_rrf_matches_hand_calculation():
-    result = dict(fuse({"a": [("p1", 5), ("p2", 1)], "b": [("p2", 7), ("p1", 2)]}))
+    result = dict(fuse_ranks({"a": [("p1", 5), ("p2", 1)], "b": [("p2", 7), ("p1", 2)]}))
     assert result["p1"] == result["p2"] == 1 / 61 + 1 / 62
 
 
@@ -73,8 +54,8 @@ def test_bootstrap_is_seed_reproducible_and_trials_grouped():
     rows = []
     for trial in range(3):
         rows += [{"query_group_id": "q1", "condition": "original", "ordered_product_ids": []}, {"query_group_id": "q1", "condition": "normalized", "ordered_product_ids": ["put"]}]
-    first = paired_metrics(rows, "put", samples=50)
-    assert first == paired_metrics(rows, "put", samples=50)
+    first = compute_paired_metrics(rows, "put", samples=50)
+    assert first == compute_paired_metrics(rows, "put", samples=50)
     normalized = next(row for row in first if row["condition"] == "normalized")
     assert normalized["groups"] == 1
     assert normalized["ci_low"] is None

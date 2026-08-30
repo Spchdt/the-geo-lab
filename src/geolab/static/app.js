@@ -1,3 +1,10 @@
+// Sample catalogues, the attribute editor, and the run-status poller.
+
+const ACTIVE_RUN_STATUSES = ['queued', 'running', 'cancelling'];
+const POLL_INTERVAL_MS = 1000;
+const RETRY_INTERVAL_MS = 2000;
+const PREFERENCE_DEFAULT = 'exact';
+
 const formPanel = document.querySelector('#product-form-panel');
 const attributeRows = document.querySelector('#attribute-rows');
 
@@ -11,12 +18,12 @@ const addAttributeRow = (attribute = {}) => {
     <label>Unit<input name="attribute_unit" placeholder="hours" value="${attribute.unit || ''}"></label>
     <label>Better when<select name="attribute_preference"><option value="higher">Higher</option><option value="lower">Lower</option><option value="exact">Exact match</option></select></label>
     <button type="button" class="secondary remove-attribute" aria-label="Remove attribute">Remove</button>`;
-  row.querySelector('select').value = attribute.preference || 'exact';
+  row.querySelector('select').value = attribute.preference || PREFERENCE_DEFAULT;
   row.querySelector('.remove-attribute').addEventListener('click', () => row.remove());
   attributeRows.appendChild(row);
 };
 
-const samples = {
+const SAMPLE_LISTINGS = {
   strong: {
     product_name: 'Nimbus Buds Pro', category: 'wireless earbuds', price: '129',
     listing_title: 'Nimbus Buds Pro — ANC Wireless Earbuds, 32-Hour Battery',
@@ -97,7 +104,7 @@ document.querySelector('#toggle-product-form')?.addEventListener('click', () => 
 });
 document.querySelector('#add-attribute')?.addEventListener('click', () => addAttributeRow());
 document.querySelectorAll('[data-sample]').forEach((button) => button.addEventListener('click', () => {
-  const sample = samples[button.dataset.sample];
+  const sample = SAMPLE_LISTINGS[button.dataset.sample];
   formPanel.hidden = false;
   for (const [name, value] of Object.entries(sample)) {
     if (name !== 'attributes') formPanel.querySelector(`[name="${name}"]`).value = value;
@@ -111,9 +118,9 @@ const root = document.querySelector('[data-run-id]');
 if (root) {
   const runId = root.dataset.runId;
   const cancelForm = document.querySelector('#cancel-form');
-  let wasActive = ['queued', 'running', 'cancelling'].includes(document.querySelector('#run-status').textContent.trim());
+  let wasActive = ACTIVE_RUN_STATUSES.includes(document.querySelector('#run-status').textContent.trim());
 
-  const render = (data) => {
+  const renderRunStatus = (data) => {
     const status = document.querySelector('#run-status');
     status.textContent = data.run.status;
     status.className = `status ${data.run.status}`;
@@ -134,20 +141,20 @@ if (root) {
       button.disabled = true;
       button.textContent = 'Cancelling…';
     }
-    const active = ['queued', 'running', 'cancelling'].includes(data.run.status);
+    const active = ACTIVE_RUN_STATUSES.includes(data.run.status);
     if (wasActive && !active) window.location.reload();
     wasActive = active;
     return active;
   };
 
-  const poll = async () => {
+  const pollRunStatus = async () => {
     try {
       const response = await fetch(`/api/runs/${runId}/status`, {cache: 'no-store'});
       if (!response.ok) throw new Error(`Status HTTP ${response.status}`);
-      if (render(await response.json())) setTimeout(poll, 1000);
+      if (renderRunStatus(await response.json())) setTimeout(pollRunStatus, POLL_INTERVAL_MS);
     } catch (error) {
       document.querySelector('#run-detail').textContent = `Dashboard connection error: ${error.message}. Retrying…`;
-      setTimeout(poll, 2000);
+      setTimeout(pollRunStatus, RETRY_INTERVAL_MS);
     }
   };
 
@@ -159,7 +166,7 @@ if (root) {
     try {
       const response = await fetch(cancelForm.action, {method: 'POST', headers: {'X-Requested-With': 'fetch'}});
       if (!response.ok) throw new Error(`Cancel HTTP ${response.status}`);
-      await poll();
+      await pollRunStatus();
     } catch (error) {
       button.disabled = false;
       button.textContent = 'Cancel';
@@ -167,5 +174,5 @@ if (root) {
     }
   });
 
-  poll();
+  pollRunStatus();
 }

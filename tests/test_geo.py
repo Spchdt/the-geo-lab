@@ -2,29 +2,12 @@ import json
 import time
 
 import pytest
+from conftest import form
 
-from intenttwin.db import all as db_all, connect, one
-from intenttwin.geo import (build_product_submission, generate_queries,
-                            generate_variants, validate_summary)
-from intenttwin.pipeline import (build_human_explanation,
-                                 create_confirmation_run, create_geo_run,
-                                 load_gap_report)
-
-
-def form():
-    return {
-        "product_name": "PocketVolt",
-        "category": "wireless earbuds",
-        "listing_title": "PocketVolt portable charger",
-        "listing_description": "A compact charger for everyday use.",
-        "price": "75.00",
-        "attributes_json": json.dumps([
-            {"name": "Battery life", "value": "32", "unit": "hours", "preference": "higher"},
-            {"name": "Earbud weight", "value": "4.8", "unit": "g", "preference": "lower"},
-            {"name": "Noise cancellation", "value": "Active", "unit": "", "preference": "exact"},
-            {"name": "Warranty", "value": "24", "unit": "months", "preference": "higher"},
-        ]),
-    }
+from geolab.core import treatment_claim_errors
+from geolab.db import connect, fetch_all, fetch_one
+from geolab.geo import build_product_submission, generate_queries, generate_variants, validate_summary
+from geolab.pipeline import build_human_explanation, create_confirmation_run, create_geo_run, load_gap_report
 
 
 def test_submission_queries_and_variants_are_deterministic_and_treatment_blind():
@@ -48,6 +31,14 @@ def test_submission_queries_and_variants_are_deterministic_and_treatment_blind()
     assert all(len(set(variant["exposed_fact_ids"]) - set(variants[0]["exposed_fact_ids"])) == 1 for variant in single)
 
 
+def test_misleading_control_states_a_number_the_facts_do_not_support():
+    product = build_product_submission(form())
+    variants = {variant["condition"]: variant for variant in generate_variants(product)}
+    misleading = {**variants["misleading_control"], "exposed_fact_ids": variants["misleading_control"]["exposed_fact_ids"]}
+    assert treatment_claim_errors(product, misleading) == ["typed claim disagrees with canonical truth"]
+    assert treatment_claim_errors(product, variants["complete_specs"]) == []
+
+
 def test_product_form_validation_and_summary_evidence_validation():
     invalid = form()
     invalid["price"] = "many"
@@ -69,7 +60,7 @@ def test_human_explanation_uses_query_text_not_internal_ids():
         "winner_metrics": {"retrieval_mrr_delta": 0.051, "retrieval_top3_delta": 0.333, "top3_delta": -0.167},
         "variant_explanations": {"intent_aligned": {
             "retrieval_improved_query_ids": ["q-1"], "retrieval_worsened_query_ids": [],
-            "gemini_improved_query_ids": [], "gemini_worsened_query_ids": ["q-2"],
+            "agent_improved_query_ids": [], "agent_worsened_query_ids": ["q-2"],
         }},
     }
     manifest = {"queries": [{"query_group_id": "q-1", "text": "wireless earbuds for commuting"}, {"query_group_id": "q-2", "text": "lightweight earbuds"}]}
@@ -82,12 +73,12 @@ def test_human_explanation_uses_query_text_not_internal_ids():
 
 
 def test_screen_reaches_every_variant_and_confirmation_promotes_two(tmp_path, monkeypatch):
-    monkeypatch.setattr("intenttwin.db.DB_PATH", tmp_path / "geo.db")
-    monkeypatch.setattr("intenttwin.pipeline.connect", __import__("intenttwin.db", fromlist=["connect"]).connect)
-    monkeypatch.setenv("INTENTTWIN_LLM_URL", "https://recorded.test/v1/chat/completions")
-    monkeypatch.setenv("INTENTTWIN_LLM_MODEL", "recorded-test-model")
-    monkeypatch.setenv("INTENTTWIN_LLM_API_KEY", "test-key")
-    monkeypatch.setenv("INTENTTWIN_LLM_MIN_INTERVAL", "0")
+    monkeypatch.setattr("geolab.db.DB_PATH", tmp_path / "geo.db")
+    monkeypatch.setattr("geolab.pipeline.connect", connect)
+    monkeypatch.setenv("GEOLAB_LLM_URL", "https://recorded.test/v1/chat/completions")
+    monkeypatch.setenv("GEOLAB_LLM_MODEL", "recorded-test-model")
+    monkeypatch.setenv("GEOLAB_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("GEOLAB_LLM_MIN_INTERVAL", "0")
     calls = []
 
     def recorded(request):
@@ -101,18 +92,18 @@ def test_screen_reaches_every_variant_and_confirmation_promotes_two(tmp_path, mo
         query_id = request["queries"][0]["query_group_id"]
         return {"headline": "Controlled result.", "gaps": [{"name": "Listing structure", "explanation": "A clearer structure was tested.", "fact_ids": [], "query_ids": [query_id]}], "suggestions": ["Use explicit labels."], "revised_title": "PocketVolt", "revised_body": "Verified listing details.", "caveat": "Controlled catalogue only."}, "recorded-test-model", 0
 
-    monkeypatch.setattr("intenttwin.pipeline.recommend", recorded)
-    monkeypatch.setattr("intenttwin.pipeline.summarize_gap_report", summarized)
+    monkeypatch.setattr("geolab.pipeline.recommend", recorded)
+    monkeypatch.setattr("geolab.pipeline.summarize_gap_report", summarized)
     screen_id = create_geo_run(form())
     for _ in range(300):
-        run = one("SELECT * FROM runs WHERE id=?", (screen_id,))
+        run = fetch_one("SELECT * FROM runs WHERE id=?", (screen_id,))
         if run and run["status"] not in {"queued", "running"}:
             break
         time.sleep(0.02)
     assert run["status"] == "passed"
     manifest = json.loads(run["manifest_json"])
     assert len(calls) == 6 * len(manifest["conditions"]) == 60
-    assert {row["condition"] for row in db_all("SELECT condition FROM llm_attempts WHERE run_id=?", (screen_id,))} == set(manifest["conditions"])
+    assert {row["condition"] for row in fetch_all("SELECT condition FROM llm_attempts WHERE run_id=?", (screen_id,))} == set(manifest["conditions"])
     report = load_gap_report(screen_id)
     assert report["original_listing"] == manifest["product_snapshot"]["original_presentation"]
     assert report["winning_listing"]
@@ -122,7 +113,7 @@ def test_screen_reaches_every_variant_and_confirmation_promotes_two(tmp_path, mo
 
     confirmation_id = create_confirmation_run(screen_id)
     for _ in range(300):
-        confirmation = one("SELECT * FROM runs WHERE id=?", (confirmation_id,))
+        confirmation = fetch_one("SELECT * FROM runs WHERE id=?", (confirmation_id,))
         if confirmation and confirmation["status"] not in {"queued", "running"}:
             break
         time.sleep(0.02)
@@ -130,4 +121,4 @@ def test_screen_reaches_every_variant_and_confirmation_promotes_two(tmp_path, mo
     confirmation_manifest = json.loads(confirmation["manifest_json"])
     assert confirmation_manifest["phase"] == "confirmation"
     assert len(confirmation_manifest["conditions"]) == 4
-    assert len(db_all("SELECT * FROM llm_attempts WHERE run_id=?", (confirmation_id,))) == 48
+    assert len(fetch_all("SELECT * FROM llm_attempts WHERE run_id=?", (confirmation_id,))) == 48

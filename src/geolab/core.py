@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Deterministic retrieval, treatment rendering, and paired-metric primitives."""
 
 import hashlib
 import json
@@ -6,13 +6,14 @@ import math
 import random
 import re
 from collections import defaultdict
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 
-CONDITIONS = ("original", "normalized", "grounded_enriched", "identity_copy", "misleading_control")
+SEMANTIC_DIMENSIONS = 128
+RRF_K = 60
+BOOTSTRAP_SAMPLES = 1000
+ANALYSIS_SEED = 20260829
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -27,11 +28,7 @@ def stable_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
-
-def facts_by_predicate(product: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def index_facts_by_predicate(product: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {fact["predicate"]: fact for fact in product["facts"]}
 
 
@@ -60,39 +57,6 @@ def fact_is_exposed(fact: dict[str, Any], text: str) -> bool:
     return bool(unit and re.search(rf"{bounded}\s*{unit}\b", text, re.IGNORECASE))
 
 
-def render_treatment(product: dict[str, Any], original: str, condition: str, is_put: bool) -> dict[str, Any]:
-    if not is_put or condition in {"original", "identity_copy"}:
-        body = original.replace("\r\n", "\n") if condition != "identity_copy" else original
-        exposed = [fact["fact_id"] for fact in product["facts"] if fact_is_exposed(fact, body)]
-    else:
-        facts = facts_by_predicate(product)
-        exposed = [f["fact_id"] for f in product["facts"] if f["status"] == "verified"]
-        if condition == "normalized":
-            exposed_facts = [f for f in product["facts"] if fact_is_exposed(f, original)]
-            exposed = [f["fact_id"] for f in exposed_facts]
-        else:
-            exposed_facts = [f for f in product["facts"] if f["status"] == "verified"]
-        title = product["name"]
-        labels = {"capacity": "Capacity", "price": "Price", "weight": "Weight", "ports": "Ports"}
-        lines = []
-        for fact in exposed_facts:
-            value = f"{fact['value']:,}" if isinstance(fact["value"], int) else f"{fact['value']:.2f}"
-            lines.append(f"{labels.get(fact['predicate'], fact['predicate'].title())}: {value} {fact['unit']}")
-        body = "\n".join([title, *lines])
-        if condition == "misleading_control":
-            capacity = facts["capacity"]
-            body = body.replace(f"{capacity['value']:,}", f"{capacity['value'] + 10000:,}")
-    return {
-        "presentation_id": f"{product['product_id']}:{condition}:v1",
-        "product_id": product["product_id"],
-        "condition": condition,
-        "title": product["name"],
-        "body": body,
-        "exposed_fact_ids": exposed,
-        "content_hash": stable_hash(body),
-    }
-
-
 def assert_competitors_unchanged(presentations: list[dict[str, Any]], put_id: str) -> None:
     hashes: dict[str, set[str]] = defaultdict(set)
     for item in presentations:
@@ -106,9 +70,6 @@ def assert_competitors_unchanged(presentations: list[dict[str, Any]], put_id: st
 def treatment_claim_errors(product: dict[str, Any], presentation: dict[str, Any]) -> list[str]:
     fact_ids = {fact["fact_id"] for fact in product["facts"]}
     errors = [fact_id for fact_id in presentation["exposed_fact_ids"] if fact_id not in fact_ids]
-    if presentation["condition"] == "normalized" and product.get("original_presentation"):
-        allowed = {fact["fact_id"] for fact in product["facts"] if fact_is_exposed(fact, product["original_presentation"])}
-        errors.extend(f"normalized fact absent from original: {fact_id}" for fact_id in presentation["exposed_fact_ids"] if fact_id not in allowed)
     if presentation["condition"] == "misleading_control":
         exposed = [fact for fact in product["facts"] if fact["fact_id"] in presentation["exposed_fact_ids"]]
         if any(not fact_is_exposed(fact, presentation["body"]) for fact in exposed):
@@ -117,7 +78,7 @@ def treatment_claim_errors(product: dict[str, Any], presentation: dict[str, Any]
 
 
 def check_constraint(product: dict[str, Any], constraints: list[dict[str, Any]]) -> tuple[str, list[str]]:
-    facts = facts_by_predicate(product)
+    facts = index_facts_by_predicate(product)
     unknown, reasons = False, []
     ops = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, "=": lambda a, b: a == b}
     for rule in constraints:
@@ -130,27 +91,27 @@ def check_constraint(product: dict[str, Any], constraints: list[dict[str, Any]])
     return ("UNKNOWN" if unknown else "PASS"), reasons
 
 
-def tokens(text: str) -> list[str]:
+def tokenize(text: str) -> list[str]:
     return TOKEN_RE.findall(text.lower())
 
 
-def semantic_vector(text: str, dims: int = 128) -> np.ndarray:
+def embed_text(text: str, dims: int = SEMANTIC_DIMENSIONS) -> np.ndarray:
     vector = np.zeros(dims)
-    for token in tokens(text):
+    for token in tokenize(text):
         digest = hashlib.sha256(token.encode()).digest()
         vector[int.from_bytes(digest[:2], "big") % dims] += 1 if digest[2] % 2 else -1
     norm = np.linalg.norm(vector)
     return vector / norm if norm else vector
 
 
-def channel_ranks(query: dict[str, Any], presentations: list[dict[str, Any]], products: dict[str, dict[str, Any]]) -> dict[str, list[tuple[str, float]]]:
-    query_tokens = set(tokens(query["text"]))
-    query_vec = semantic_vector(query["text"])
+def rank_channels(query: dict[str, Any], presentations: list[dict[str, Any]]) -> dict[str, list[tuple[str, float]]]:
+    query_tokens = set(tokenize(query["text"]))
+    query_vec = embed_text(query["text"])
     channels: dict[str, list[tuple[str, float]]] = {"lexical": [], "semantic": [], "attribute": []}
     for item in presentations:
-        body_tokens = tokens(item["body"])
+        body_tokens = tokenize(item["body"])
         lexical = sum(1 for token in body_tokens if token in query_tokens) / math.sqrt(max(1, len(body_tokens)))
-        semantic = float(np.dot(query_vec, semantic_vector(item["body"])))
+        semantic = float(np.dot(query_vec, embed_text(item["body"])))
         exposed = {fact_id.rsplit(":", 1)[-1] for fact_id in item["exposed_fact_ids"]}
         attribute = sum(1.0 for rule in query["hard_constraints"] if rule["predicate"] in exposed)
         for channel, score in (("lexical", lexical), ("semantic", semantic), ("attribute", attribute)):
@@ -160,7 +121,7 @@ def channel_ranks(query: dict[str, Any], presentations: list[dict[str, Any]], pr
     return channels
 
 
-def fuse(channels: dict[str, list[tuple[str, float]]], k: int = 60) -> list[tuple[str, float]]:
+def fuse_ranks(channels: dict[str, list[tuple[str, float]]], k: int = RRF_K) -> list[tuple[str, float]]:
     scores: dict[str, float] = defaultdict(float)
     for rows in channels.values():
         for rank, (product_id, _score) in enumerate(rows, 1):
@@ -192,7 +153,7 @@ def validate_recommendation(output: dict[str, Any], candidates: set[str], expose
     return errors
 
 
-def paired_metrics(rows: Iterable[dict[str, Any]], put_id: str, seed: int = 20260829, samples: int = 1000, conditions: Iterable[str] | None = None) -> list[dict[str, Any]]:
+def compute_paired_metrics(rows: Iterable[dict[str, Any]], put_id: str, seed: int = ANALYSIS_SEED, samples: int = BOOTSTRAP_SAMPLES, conditions: Iterable[str] | None = None) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, list[dict[str, float]]]] = defaultdict(lambda: defaultdict(list))
     seen_conditions: list[str] = []
     for row in rows:
@@ -214,7 +175,7 @@ def paired_metrics(rows: Iterable[dict[str, Any]], put_id: str, seed: int = 2026
     original = {qid: {key: average(values["original"], key) for key in ("any", "top1", "top3", "mrr")} for qid, values in grouped.items() if values.get("original")}
     rng = random.Random(seed)
     result = []
-    ordered_conditions = list(conditions) if conditions is not None else (seen_conditions or list(CONDITIONS))
+    ordered_conditions = list(conditions) if conditions is not None else seen_conditions
     for condition in ordered_conditions:
         pairs = [(original[qid], {key: average(values[condition], key) for key in ("any", "top1", "top3", "mrr")}) for qid, values in grouped.items() if qid in original and values.get(condition)]
         deltas = [b["any"] - a["any"] for a, b in pairs]

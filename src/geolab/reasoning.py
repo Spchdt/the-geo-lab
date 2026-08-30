@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Structured-output calls to the configured OpenAI-compatible provider."""
 
 import json
 import os
@@ -12,6 +12,9 @@ from typing import Any
 
 from .core import canonical_json
 
+DEFAULT_TIMEOUT_SECONDS = "30"
+ERROR_DETAIL_LIMIT = 500
+
 
 class LLMRequestError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None, retry_after: float | None = None):
@@ -20,7 +23,7 @@ class LLMRequestError(RuntimeError):
         self.retry_after = retry_after
 
 
-def _retry_after_seconds(error: urllib.error.HTTPError, detail: str) -> float | None:
+def _parse_retry_after(error: urllib.error.HTTPError, detail: str) -> float | None:
     header = error.headers.get("Retry-After") if error.headers else None
     if header:
         try:
@@ -35,7 +38,7 @@ def _retry_after_seconds(error: urllib.error.HTTPError, detail: str) -> float | 
     return float(match.group(1)) if match else None
 
 
-def _http_error_detail(error: urllib.error.HTTPError) -> tuple[str, float | None]:
+def _read_http_error(error: urllib.error.HTTPError) -> tuple[str, float | None]:
     raw = error.read().decode("utf-8", errors="replace")
     detail = raw
     try:
@@ -43,8 +46,8 @@ def _http_error_detail(error: urllib.error.HTTPError) -> tuple[str, float | None
         detail = payload.get("error", {}).get("message") or raw
     except json.JSONDecodeError:
         pass
-    detail = " ".join(detail.split())[:500]
-    return detail, _retry_after_seconds(error, raw)
+    detail = " ".join(detail.split())[:ERROR_DETAIL_LIMIT]
+    return detail, _parse_retry_after(error, raw)
 
 
 def load_env_file(path: Path) -> None:
@@ -63,11 +66,11 @@ def load_env_file(path: Path) -> None:
 def llm_config() -> dict[str, str]:
     load_env_file(Path(__file__).resolve().parents[2] / ".env")
     config = {
-        "url": os.getenv("INTENTTWIN_LLM_URL", ""),
-        "model": os.getenv("INTENTTWIN_LLM_MODEL", ""),
-        "api_key": os.getenv("INTENTTWIN_LLM_API_KEY", ""),
+        "url": os.getenv("GEOLAB_LLM_URL", ""),
+        "model": os.getenv("GEOLAB_LLM_MODEL", ""),
+        "api_key": os.getenv("GEOLAB_LLM_API_KEY", ""),
     }
-    missing = [f"INTENTTWIN_LLM_{name.upper()}" for name, value in config.items() if not value]
+    missing = [f"GEOLAB_LLM_{name.upper()}" for name, value in config.items() if not value]
     if missing:
         raise RuntimeError("LLM not configured: " + ", ".join(missing))
     return config
@@ -105,11 +108,11 @@ def recommend(request_data: dict[str, Any]) -> tuple[dict[str, Any], str, int]:
     }
     http_request = urllib.request.Request(config["url"], data=canonical_json(body).encode(), headers={"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(http_request, timeout=float(os.getenv("INTENTTWIN_LLM_TIMEOUT", "30"))) as response:
+        with urllib.request.urlopen(http_request, timeout=float(os.getenv("GEOLAB_LLM_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))) as response:
             payload = json.loads(response.read())
         output = json.loads(payload["choices"][0]["message"]["content"])
     except urllib.error.HTTPError as exc:
-        detail, retry_after = _http_error_detail(exc)
+        detail, retry_after = _read_http_error(exc)
         raise LLMRequestError(f"LLM HTTP {exc.code}: {detail or exc.reason}", status_code=exc.code, retry_after=retry_after) from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         raise LLMRequestError(f"LLM request failed: {exc}") from exc
@@ -146,11 +149,11 @@ def summarize_gap_report(request_data: dict[str, Any]) -> tuple[dict[str, Any], 
     }
     http_request = urllib.request.Request(config["url"], data=canonical_json(body).encode(), headers={"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(http_request, timeout=float(os.getenv("INTENTTWIN_LLM_TIMEOUT", "30"))) as response:
+        with urllib.request.urlopen(http_request, timeout=float(os.getenv("GEOLAB_LLM_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))) as response:
             payload = json.loads(response.read())
         output = json.loads(payload["choices"][0]["message"]["content"])
     except urllib.error.HTTPError as exc:
-        detail, retry_after = _http_error_detail(exc)
+        detail, retry_after = _read_http_error(exc)
         raise LLMRequestError(f"LLM HTTP {exc.code}: {detail or exc.reason}", status_code=exc.code, retry_after=retry_after) from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         raise LLMRequestError(f"LLM request failed: {exc}") from exc
